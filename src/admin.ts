@@ -17,8 +17,8 @@ import {
 } from './storage'
 import { testModelConnection } from './proxy'
 import { MAX_ADMIN_REQUEST_BYTES, readOptionalJSONLimited, readStrictJSONLimited } from './request-body'
-import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS } from './config'
-import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm, OAUTH_POOL_KV_PREFIX } from './oauth'
+import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, KV_KEYS, CHECKIN_RESULT_TTL_SEC } from './config'
+import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm, decodeJwtUid, OAUTH_POOL_KV_PREFIX } from './oauth'
 import { isOAuthPoolProvider, seedOauthPoolFromSingle, listOauthPoolStatus, removeOauthAccount, readOauthPool, setOauthAccountEnabled } from './oauth-pool'
 import { injectWorkbuddyChatHeaders, ensureGlobalFallbackSystem } from './workbuddy-upstream'
 import { probeWorkbuddyModelCatalogForProvider, __resetWorkbuddyCatalogCacheForTests } from './workbuddy-models'
@@ -36,6 +36,7 @@ import type {
   TestModelRequest,
   OAuthDeviceConfig,
   OAuthTokenState,
+  CheckinResult,
 } from './types'
 
 // ===== 系统状态 =====
@@ -643,6 +644,24 @@ export async function handleGetProxyKeys(c: Context<AppEnv>) {
   return c.json<ApiResponse>({ success: true, data: maskedKeys })
 }
 
+/**
+ * GET /admin/api/proxy-keys/:id/reveal：返回指定转发 Key 的完整明文。
+ *
+ * 列表接口为防肩窥只返回脱敏值，但用户需要能复制完整 Key —— 两者并存的做法是
+ * 把明文放在独立端点、按需单条取回，而不是让列表一次性把全部 Key 明文塞进页面 DOM。
+ *
+ * 注意：Key 在 KV 中以明文存储（鉴权要按值比对），所以「创建后无法再查看」这个旧说法
+ * 不成立，面板文案已同步更正为「列表脱敏、按需复制」。
+ */
+export async function handleRevealProxyKey(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const keys = await getProxyKeys(c.env)
+  const found = keys.find((k) => k.id === id)
+  if (!found) return c.json<ApiResponse>({ success: false, message: 'Key 不存在' }, 404)
+  return c.json<ApiResponse>({ success: true, data: { id: found.id, key: found.key } })
+}
+
 export async function handleCreateProxyKey(c: Context<AppEnv>) {
   const body = await readStrictJSONLimited<CreateProxyKeyRequest>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   const id = crypto.randomUUID()
@@ -759,6 +778,36 @@ export async function handleOAuthStatus(c: Context<AppEnv>) {
   return c.json<ApiResponse>({ success: true, data })
 }
 
+/**
+ * 从签到结果快照里摘掉指定账号。
+ *
+ * 概览页的「账号数 / 剩余积分 / 到期积分」读的是这份快照（readCheckinResult），
+ * 而不是账号池实时状态。删号若不清理，会留下「账号已删、额度还在统计」的幽灵数据。
+ * 放在 admin.ts 内直接用 KV 键处理，避免 checkin.ts ↔ admin.ts 的循环导入。
+ */
+async function pruneCheckinResultAccount(env: Env, providerId: string, uid: string): Promise<void> {
+  const key = KV_KEYS.CHECKIN_RESULT_PREFIX + providerId
+  const raw = await env.KV.get(key)
+  if (!raw) return
+  let parsed: CheckinResult
+  try { parsed = JSON.parse(raw) as CheckinResult } catch { return }
+  // 多账号池：accounts 为逐账号结果数组
+  if (Array.isArray(parsed.accounts)) {
+    const next = parsed.accounts.filter((a) => a.uid !== uid)
+    if (next.length === parsed.accounts.length) return
+    if (next.length === 0) {
+      await env.KV.delete(key)
+      return
+    }
+    await env.KV.put(key, JSON.stringify({ ...parsed, accounts: next }), {
+      expirationTtl: CHECKIN_RESULT_TTL_SEC,
+    })
+    return
+  }
+  // 单账号形态：快照本身就是该账号
+  if (parsed.uid === uid) await env.KV.delete(key)
+}
+
 /** 删除 WorkBuddy 池内指定 uid 账号。 */
 export async function handleOAuthPoolRemove(c: Context<AppEnv>) {
   const id = c.req.param('id')
@@ -773,6 +822,23 @@ export async function handleOAuthPoolRemove(c: Context<AppEnv>) {
   if (!uid) return c.json<ApiResponse>({ success: false, message: '缺少 uid 参数' }, 400)
   const removed = await removeOauthAccount(c.env, id, uid)
   if (!removed) return c.json<ApiResponse>({ success: false, message: '账号不存在' }, 404)
+  // 单账号 token 是账号池的「种子」：seedOauthPoolFromSingle 在池为空时会把它的 uid
+  // 重新播种回池里。只删池内条目会让账号在下次拉取状态时「复活」，所以若这颗种子
+  // 指向的正是被删账号，必须同步清掉。
+  try {
+    const single = await readOauthToken(c.env, id)
+    if (single?.access_token && decodeJwtUid(single.access_token) === uid) {
+      await deleteOauthToken(c.env, id)
+    }
+  } catch {
+    // 清理种子失败不回滚已完成的删除，账号至少已不在池内
+  }
+  // 同步摘掉签到快照里的该账号，否则概览仍按旧快照统计额度与账号数
+  try {
+    await pruneCheckinResultAccount(c.env, id, uid)
+  } catch {
+    // 快照清理失败不影响删除结果，仅概览可能短暂滞后
+  }
   return c.json<ApiResponse>({ success: true, message: '已从账号池删除 ' + uid })
 }
 

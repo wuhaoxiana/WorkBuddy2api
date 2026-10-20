@@ -501,9 +501,9 @@ export async function renderAdminPage(c: Context<AppEnv>) {
 <!-- Key 创建结果：完整 Key 只在此处展示这一次 -->
 <div class="mask" id="m-key-done">
   <div class="modal">
-    <div class="modal-h"><h3>Key 已创建</h3><button class="btn btn-sm btn-ghost" data-close>关闭</button></div>
+    <div class="modal-h"><h3 id="m-key-done-title">Key 已创建</h3><button class="btn btn-sm btn-ghost" data-close>关闭</button></div>
     <div class="modal-b">
-      <div class="notice bad"><b>这段 Key 只显示这一次。</b>关闭后服务端只保留哈希，无法再查出完整值，请立即复制保存。</div>
+      <div class="notice bad" id="m-key-done-note"><b>请立即复制保存。</b>关闭后可在列表点「复制」再次取回完整 Key。</div>
       <div class="field">
         <label>完整 Key</label>
         <code class="keybox" id="key-new-val"></code>
@@ -783,7 +783,8 @@ async function loadKeys() {
       const badge = !k.enabled ? '<span class="badge b-mute">已停用</span>' : expired ? '<span class="badge b-bad">已过期</span>' : '<span class="badge b-ok">有效</span>';
       return \`<tr>
         <td style="font-weight:600">\${esc(k.name || '(未命名)')}</td>
-        <td class="mono" style="font-size:12px">\${esc(k.key)}</td>
+        <td class="mono" style="font-size:12px">\${esc(k.key)}
+          <button class="btn btn-sm" data-kcopy="\${esc(k.id)}">复制</button></td>
         <td>\${badge}</td>
         <td class="faint">\${esc(k.expiresAt ? fmtTime(new Date(k.expiresAt).getTime()) : '永久')}</td>
         <td class="tr nowrap">
@@ -793,7 +794,7 @@ async function loadKeys() {
       </tr>\`;
     }).join('');
     $('keys').innerHTML = \`<table><thead><tr><th>名称</th><th>Key（脱敏）</th><th>状态</th><th>到期</th><th class="tr">操作</th></tr></thead><tbody>\${rows}</tbody></table>
-      <p class="hint-inline">完整 Key 只在创建时展示一次，服务端仅保存哈希，此处无法再查看或复制。若已丢失，请删除该条后重新创建。</p>\`;
+      <p class="hint-inline">列表只显示脱敏值；点「复制」取回该条完整 Key。完整 Key 可在本页按需查看，请在可信环境下操作。</p>\`;
     $('keys').querySelectorAll('[data-ktoggle]').forEach((b) => b.addEventListener('click', async () => {
       try {
         await api('/admin/api/proxy-keys/' + encodeURIComponent(b.dataset.ktoggle), {
@@ -808,6 +809,21 @@ async function loadKeys() {
         await api('/admin/api/proxy-keys/' + encodeURIComponent(b.dataset.kdel), { method: 'DELETE' });
         await loadKeys();
         toast('已删除', 'ok');
+      } catch (e) { toast(e.message, 'bad'); }
+    }));
+    // 复制完整 Key：列表只给脱敏值，这里按 id 单条取回明文。
+    // 剪贴板写入放在 fetch 之后可能因手势过期被拒，此时退回弹窗让用户手动复制。
+    $('keys').querySelectorAll('[data-kcopy]').forEach((b) => b.addEventListener('click', async () => {
+      try {
+        const j = await api('/admin/api/proxy-keys/' + encodeURIComponent(b.dataset.kcopy) + '/reveal');
+        const full = (j.data || {}).key || '';
+        if (!full) { toast('未取到完整 Key', 'bad'); return; }
+        try {
+          await navigator.clipboard.writeText(full);
+          toast('已复制完整 Key', 'ok');
+        } catch (err) {
+          showFullKey(full, '完整 Key', '浏览器拒绝自动复制，已为你展开完整 Key。请手动选中后按 Ctrl+C。');
+        }
       } catch (e) { toast(e.message, 'bad'); }
     }));
   } catch (e) {
@@ -1029,12 +1045,19 @@ $('btn-create-key').addEventListener('click', async (e) => {
     // 完整 Key 只在创建响应里出现这一次：用弹窗常驻展示并允许手动选中。
     // 不能再用 toast 承载——toast 2.8 秒自动消失，且窄气泡会把长 Key 省略号截断，
     // 这正是「创建后看不到完整 Key」的根因。
-    if (!k) { toast('已创建，但响应未返回完整 Key，请删除后重建', 'bad'); return; }
-    $('key-new-val').textContent = k;
-    $('m-key-done').classList.add('on');
+    if (!k) { toast('已创建，但响应未返回完整 Key', 'bad'); return; }
+    showFullKey(k, 'Key 已创建');
   } catch (err) { toast(err.message, 'bad'); }
   finally { busy(btn, false); }
 });
+
+/** 在弹窗里展示一份完整 Key（创建成功、或列表复制被浏览器拒绝时的兜底） */
+function showFullKey(key, title, note) {
+  $('key-new-val').textContent = key;
+  $('m-key-done-title').textContent = title || '完整 Key';
+  if (note) $('m-key-done-note').innerHTML = note;
+  $('m-key-done').classList.add('on');
+}
 
 /** 选中元素全部文本（剪贴板不可用时的兜底） */
 function selectElementText(el) {

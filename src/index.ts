@@ -22,6 +22,7 @@ import {
   handleTestKeyNew,
   handleTestModelNew,
   handleGetProxyKeys,
+  handleRevealProxyKey,
   handleCreateProxyKey,
   handleUpdateProxyKey,
   handleDeleteProxyKey,
@@ -154,6 +155,8 @@ app.post('/admin/api/test-model', handleTestModelNew)
 
 // 转发 Key 管理
 app.get('/admin/api/proxy-keys', handleGetProxyKeys)
+// 单条取回完整 Key（列表只给脱敏值）
+app.get('/admin/api/proxy-keys/:id/reveal', handleRevealProxyKey)
 app.post('/admin/api/proxy-keys', handleCreateProxyKey)
 app.delete('/admin/api/proxy-keys/:id', handleDeleteProxyKey)
 app.patch('/admin/api/proxy-keys/:id', handleUpdateProxyKey)
