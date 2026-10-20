@@ -81,7 +81,7 @@ src/
 
 ---
 
-## 一、快速开始
+## 快速开始
 
 ### 1. 本地开发
 
@@ -113,7 +113,7 @@ npx wrangler kv namespace create KV
 npx wrangler deploy
 ```
 
-**二、用 GitHub Actions自动部署（推荐，仓库已带 `.github/workflows/deploy.yml`）**
+或 GitHub Actions自动部署（推荐，仓库已带 `.github/workflows/deploy.yml`）
 
 | 类型 | 名称 | 说明 |
 | --- | --- | --- |
