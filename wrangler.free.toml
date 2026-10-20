@@ -21,6 +21,13 @@ compatibility_date = "2025-07-01"
 compatibility_flags = ["nodejs_compat"]
 keep_vars = true
 
+# 显式启用 workers.dev 路由。
+# 不写这两项时 wrangler 按默认值处理，一旦 Dashboard 侧状态被改动（例如关闭
+# workers.dev），就会出现「域名解析正常但访问返回 404 / error code 1042」的现象，
+# 只能靠重新部署恢复。写死以消除这种歧义。
+workers_dev = true
+preview_urls = false
+
 # Smart Placement 免费计划同样支持：把执行点调度到离上游更近的节点
 [placement]
 mode = "smart"

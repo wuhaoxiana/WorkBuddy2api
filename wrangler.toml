@@ -4,6 +4,11 @@ compatibility_date = "2025-07-01"
 compatibility_flags = ["nodejs_compat"]
 keep_vars = true
 
+# 显式启用 workers.dev 路由，避免 Dashboard 侧状态变更导致
+# 「域名解析正常但访问 404 / error code 1042」。
+workers_dev = true
+preview_urls = false
+
 # Workers Paid：把单请求活跃 CPU 上限从默认 30s 提到 5 分钟（300000ms）。
 # 主动计算时间（SSE 解析/序列化等）才算 CPU，等网络 I/O 不计入；墙钟本来就无限。
 # 仅 Paid 生效，Free 固定 10ms 无法提高。
