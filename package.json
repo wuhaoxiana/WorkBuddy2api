@@ -6,8 +6,11 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
+    "dev:free": "wrangler dev --config wrangler.free.toml",
     "deploy": "wrangler deploy",
+    "deploy:free": "wrangler deploy --config wrangler.free.toml",
     "build": "wrangler deploy --dry-run",
+    "build:free": "wrangler deploy --dry-run --config wrangler.free.toml",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },

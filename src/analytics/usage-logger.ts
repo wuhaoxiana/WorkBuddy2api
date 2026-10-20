@@ -15,7 +15,7 @@ const MAX_SSE_BUFFER = 64 * 1024
 
 const getDatasetName = (env: Env): string => {
   const configured = env.USAGE_ANALYTICS_DATASET
-  return configured && /^[A-Za-z_][A-Za-z0-9_]*$/.test(configured) ? configured : 'ai_gateway_usage'
+  return configured && /^[A-Za-z_][A-Za-z0-9_]*$/.test(configured) ? configured : 'workbuddy_usage'
 }
 
 export const writeAnalyticsEvent = (

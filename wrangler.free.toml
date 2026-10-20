@@ -1,0 +1,59 @@
+# ============================================================================
+# Workers 免费计划（Free）部署配置
+#
+# 用法：
+#   npx wrangler deploy --config wrangler.free.toml
+#   npx wrangler dev    --config wrangler.free.toml
+#
+# 与 wrangler.toml 的两处必要差异（都是 Free 计划不支持的 Paid 专属能力）：
+#   1. 删除 [limits] cpu_ms —— Free 固定 10ms CPU/请求，无法提高
+#   2. 删除 [[analytics_engine_datasets]] —— Analytics Engine 是 Paid 专属功能
+#
+# 功能影响（仅统计与批处理能力，代理转发链路完整可用）：
+#   - 用量看板返回空数据（代码已做无绑定降级，不会报错，也不影响转发）
+#   - 签到/Token 刷新按账号数分批进行，账号多时可能触发 CPU 超时
+#   - KV 写入量受 1000 次/天限制，建议关闭请求日志（见文件末尾说明）
+# ============================================================================
+
+name = "workbuddy-2api"
+main = "src/index.ts"
+compatibility_date = "2025-07-01"
+compatibility_flags = ["nodejs_compat"]
+keep_vars = true
+
+# Smart Placement 免费计划同样支持：把执行点调度到离上游更近的节点
+[placement]
+mode = "smart"
+
+# KV namespace —— wrangler 按 name 自动解析
+[[kv_namespaces]]
+binding = "KV"
+
+[vars]
+# 保留该变量仅为兼容代码默认值；免费计划无 Analytics Engine 写入，
+# 该值不会生效，看板返回空数据属预期行为。
+USAGE_ANALYTICS_DATASET = "workbuddy_usage"
+
+# 定时任务（UTC 时间，括号内为北京时间）
+#   "0 */2 * * *"   —— 每 2 小时刷新账号池 Token
+#   "5 2,14 * * *"  —— 每日 10:05 / 22:05 自动签到
+#   "30 15 * * *"   —— 每日 23:30 夜猫子任务
+[triggers]
+crons = ["0 */2 * * *", "5 2,14 * * *", "30 15 * * *"]
+
+# ===== 在 Cloudflare Dashboard → Workers → Variables 配置以下变量 =====
+# ADMIN_USERNAME = "admin"
+# ADMIN_PASSWORD = "your-password"
+#
+# Cloudflare Access 加固（可选，仅作用于 /admin/*）
+# CF_ACCESS_ENABLED = "true"
+# CF_ACCESS_AUD = "你的 Access 应用 AUD"
+# CF_ACCESS_TEAM_DOMAIN = "你的团队域名.cloudflareaccess.com"
+#
+# ===== 免费计划必读：KV 写入配额 =====
+# 免费计划 KV 上限为 1000 次写入/天。本网关的日志系统默认开启，
+# 且每个成功请求都会写一条日志，极易在数百次请求后耗尽当天配额，
+# 耗尽后写入失败（不影响转发，但日志会缺失）。
+#
+# 建议免费计划下关闭日志：部署后在管理后台「设置」页关闭「请求日志」，
+# 或直接写入 KV：键 config:log_enabled，值 false。

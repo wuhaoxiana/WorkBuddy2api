@@ -1197,7 +1197,7 @@ function tsFromLogKey(name: string): number {
 
 /**
  * 日志内容脱敏：日志里绝不落盘密钥原文。
- * 覆盖：Bearer token、sk_cf_* 类转发 Key、API Key、x-api-key / Authorization 值、
+ * 覆盖：Bearer token、sk_wb_* 类转发 Key、API Key、x-api-key / Authorization 值、
  * Cookie（会话凭据）、token / refresh_token / secret 类的 JSON 值。
  */
 function sanitizeLogText(text: string): string {

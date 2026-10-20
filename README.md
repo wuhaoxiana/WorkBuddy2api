@@ -7,6 +7,10 @@
 > 本项目保留 WorkBuddy 全链路的代码与行为（含全部注释与踩坑记录），剥离其它提供商与通用附加能力，得到一个只需部署一次、只服务 WorkBuddy 的网关。
 > 抽取范围与逐项差异见 [与源项目的差异](#与源项目的差异)。
 
+**部署形态**：单个 Cloudflare Worker（ES Module 格式），零 Node.js 运行时依赖，生产依赖只有 `hono`。
+仓库内不含 `node:*` 模块导入、不使用 `Buffer` / `process`，可在 workerd 原生运行。
+支持 Workers **免费计划**（需改用 `wrangler.free.toml`，见 [3.1 免费计划 / 付费计划](#31-免费计划--付费计划)）。
+
 ---
 
 ## 特性
@@ -120,6 +124,44 @@ npx wrangler deploy
 
 > 建议给 Worker 绑定自定义域名：Cloudflare 的 `*.workers.dev` 在部分网络下不稳定，
 > 且 SSE 长连接对链路质量敏感。
+
+### 3.1 免费计划 / 付费计划
+
+本项目可以跑在 Workers 免费计划上，但默认的 `wrangler.toml` 含两项 **Paid 专属**能力，
+免费账号直接部署会报错。为此仓库提供了 `wrangler.free.toml`：
+
+```bash
+# 免费计划
+npm run deploy:free      # 等价于 wrangler deploy --config wrangler.free.toml
+
+# 付费计划
+npm run deploy           # 用默认 wrangler.toml
+```
+
+两份配置的唯一差异：`wrangler.free.toml` 删掉了 `[limits] cpu_ms` 与
+`[[analytics_engine_datasets]]`（Analytics Engine 属 Paid 功能；`cpu_ms` 免费计划固定 10ms 且不可调）。
+
+| 项目 | Free | Paid（$5/月起） | 对本项目的影响 |
+| --- | --- | --- | --- |
+| 请求数 | 10 万/天 | 按量计费 | 个人使用足够 |
+| CPU 时间 | **10ms/请求** | 默认 30s，本仓库配到 300s | SSE 等待 I/O 不计 CPU；但签到批处理会受限 |
+| KV 写入 | **1,000/天** | 按量计费 | **主要瓶颈**，见下方说明 |
+| KV 读取 | 10 万/天 | 按量计费 | 每次鉴权读 1 次 Key，够用 |
+| Analytics Engine | ❌ 不支持 | ✅ | 免费版用量看板返回空数据 |
+| 子请求/请求 | 50 | 1,000 | 账号多时挑号 fallback 可能触顶 |
+| 包体上限 | 3 MiB | 10 MiB | 本项 662 KiB，都满足 |
+| 定时任务 | ✅ | ✅ | 均支持 3 条 cron |
+
+**免费计划的两条实用建议：**
+
+1. **关掉请求日志**。日志默认开启，且每个成功请求都会写一条 KV 记录，
+   免费额度 1,000 次/天很容易在几百个请求后耗尽。进「设置」页关闭请求日志，
+   或直接写 KV：键 `config:log_enabled`、值 `false`。
+2. **账号池控制在 3 个以内**。Token 刷新（每 2 小时）与签到（每天 2 次）都要逐个账号写 KV，
+   账号越多，KV 写入与 CPU 时间越容易超限。免费计划的核心瓶颈是 KV 写入次数，不是转发能力。
+
+> 关闭日志不影响转发、账号池、签到与统计看板逻辑，只影响「日志」页内容。
+> 免费计划下看板为空是预期行为（无 Analytics Engine 写入），不是故障。
 
 ### 4. 加账号
 

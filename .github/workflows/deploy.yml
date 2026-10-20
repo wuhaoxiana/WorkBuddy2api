@@ -14,6 +14,8 @@ permissions:
 # 需要的 Secrets:
 #   CF_API_TOKEN   - Cloudflare API Token（权限：Workers Scripts Edit）
 #   CF_ACCOUNT_ID  - Cloudflare Account ID
+# 可选 Variables:
+#   CF_PLAN        - 设为 free 时改用 wrangler.free.toml（免费计划部署）
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -34,8 +36,14 @@ jobs:
       - name: Test
         run: npx vitest run
 
+      # 免费计划（Free）不支持 Analytics Engine 与自定义 cpu_ms，
+      # 需改用 wrangler.free.toml。在仓库 Settings → Variables 里设 CF_PLAN=free 即可切换。
+      - name: Resolve wrangler config
+        id: cfg
+        run: echo "args=${{ vars.CF_PLAN == 'free' && '--config wrangler.free.toml' || '' }}" >> "$GITHUB_OUTPUT"
+
       - name: Deploy to Cloudflare Workers
-        run: npx wrangler deploy
+        run: npx wrangler deploy ${{ steps.cfg.outputs.args }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}

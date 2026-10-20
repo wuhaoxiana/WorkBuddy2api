@@ -42,7 +42,7 @@ const FILTER_FIELDS: Record<UsageLogDimension, string> = {
 }
 
 const getRange = (value?: string): AnalyticsRange => value && value in RANGE_SQL ? value as AnalyticsRange : '24h'
-const getDataset = (env: Env): string => env.USAGE_ANALYTICS_DATASET && /^[A-Za-z_][A-Za-z0-9_]*$/.test(env.USAGE_ANALYTICS_DATASET) ? env.USAGE_ANALYTICS_DATASET : 'ai_gateway_usage'
+const getDataset = (env: Env): string => env.USAGE_ANALYTICS_DATASET && /^[A-Za-z_][A-Za-z0-9_]*$/.test(env.USAGE_ANALYTICS_DATASET) ? env.USAGE_ANALYTICS_DATASET : 'workbuddy_usage'
 const escapeSql = (value: string): string => value.replace(/'/g, "''")
 // LIKE 通配符转义：用户输入当作字面量，防止注入 %/_ 扩大匹配面。
 const escapeLike = (value: string): string => value.replace(/[\\%_]/g, '\\$&')

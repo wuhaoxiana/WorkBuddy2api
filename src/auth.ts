@@ -91,7 +91,7 @@ export async function managementAuthMiddleware(c: Context<AppEnv>, next: Next) {
 // 一次 Cf-Access-Jwt 的签名 + 声明校验，做到"绕过边缘也进不来管理后台"。
 //
 // 关键点：本中间件**只挂到 /admin/***，且配置了 CF_ACCESS_AUD 才启用（未配置是空操作）。
-// 客户端走 /v1/* 的转发 Key（sk_cf_*）鉴权，与本中间件完全无关，绝不会被它影响。
+// 客户端走 /v1/* 的转发 Key（sk_wb_*）鉴权，与本中间件完全无关，绝不会被它影响。
 //
 // Cloudflare Access JWT 规格（RS256）：
 //   - 公钥：GET https://{team}.cloudflareaccess.com/cdn-cgi/access/certs → { keys: [{kid,n,e}] }
@@ -303,7 +303,7 @@ export async function proxyKeyAuthMiddleware(c: Context<AppEnv>, next: Next) {
   const authHeader = c.req.header('Authorization')
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return c.json({
-      error: { message: '缺少或无效的 Authorization 头，格式: Bearer sk_cf_*', type: 'authentication_error' },
+      error: { message: '缺少或无效的 Authorization 头，格式: Bearer sk_wb_*', type: 'authentication_error' },
     }, 401)
   }
 
@@ -315,7 +315,7 @@ export async function proxyKeyAuthMiddleware(c: Context<AppEnv>, next: Next) {
     }, 401)
   }
 
-  // 只把令牌对象和不可逆哈希放入请求上下文，观测层绝不持久化原始 sk_cf_*。
+  // 只把令牌对象和不可逆哈希放入请求上下文，观测层绝不持久化原始 sk_wb_*。
   c.set('proxyKey', proxyKey)
   c.set('proxyKeyHash', (await hashPassword(token)).slice(0, 32))
   return next()
