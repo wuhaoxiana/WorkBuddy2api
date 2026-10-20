@@ -1,0 +1,444 @@
+import { KV_KEYS } from './config'
+import type { Env, Provider, ProxyKey, Session } from './types'
+
+// ===== 内存缓存（P1：降低热路径 KV 读放大）=====
+// 每个 isolate 内缓存 KV 原始文本 + 10s TTL；写路径同步刷新缓存。
+// 多 isolate 部署时，其它实例最多滞后一个 TTL（10s），对网关场景可接受。
+const CACHE_TTL_MS = 10_000
+
+/**
+ * 解析 provider.baseUrl 中的占位符：
+ * - {CF_ACCOUNT_ID} → env.CF_ACCOUNT_ID（Cloudflare Workers AI 的 URL 需要 Account ID）
+ * 未配置对应环境变量时返回 null，调用方应给出明确错误提示。
+ */
+export function resolveProviderBaseUrl(env: Env, baseUrl: string): string | null {
+  if (!baseUrl.includes('{CF_ACCOUNT_ID}')) return baseUrl
+  if (!env.CF_ACCOUNT_ID) return null
+  return baseUrl.replace(/\{CF_ACCOUNT_ID\}/g, env.CF_ACCOUNT_ID)
+}
+
+interface RawCacheEntry { text: string; at: number }
+const providersCache = new Map<string, RawCacheEntry>()
+const proxyKeysCache = new Map<string, RawCacheEntry>()
+// /v1/models 列表的纯内存派生缓存（非 KV 键）：复用同一套 TTL + 管理后台可视化/清空
+const MODELS_LIST_CACHE_KEY = 'models:list'
+const modelsListCache = new Map<string, RawCacheEntry>()
+
+function rawCacheGet(cache: Map<string, RawCacheEntry>, key: string): string | undefined {
+  const entry = cache.get(key)
+  if (!entry) return undefined
+  if (Date.now() - entry.at > CACHE_TTL_MS) {
+    cache.delete(key)
+    return undefined
+  }
+  return entry.text
+}
+function rawCacheSet(cache: Map<string, RawCacheEntry>, key: string, text: string): void {
+  cache.set(key, { text, at: Date.now() })
+}
+
+// ===== 内存缓存可视化（P4：管理后台可见可管）=====
+// 缓存是 isolate 本地的，多 isolate 部署时每个实例各自缓存、各自失效。
+// 面板仅能查看清空「当前实例」的缓存，无需也不应该跨实例同步。
+
+export interface CacheEntryView {
+  /** 原始 KV key */
+  key: string
+  /** 可读名称 */
+  label: string
+  /** 缓存文本大小（字节） */
+  size: number
+  /** 已缓存时长（毫秒） */
+  ageMs: number
+  /** TTL（毫秒） */
+  ttlMs: number
+}
+
+const cacheRegistry: Array<{ key: string; label: string; cache: Map<string, RawCacheEntry> }> = [
+  { key: KV_KEYS.PROVIDERS, label: '提供商配置 (providers)', cache: providersCache },
+  { key: KV_KEYS.PROXY_KEYS, label: '转发 Key (proxy:keys)', cache: proxyKeysCache },
+  { key: MODELS_LIST_CACHE_KEY, label: '模型列表缓存 (models:list)', cache: modelsListCache },
+]
+
+/** 读取 /v1/models 列表缓存（未命中/过期返回 undefined） */
+export function getModelsListCache(): string | undefined {
+  return rawCacheGet(modelsListCache, MODELS_LIST_CACHE_KEY)
+}
+/** 写入 /v1/models 列表缓存 */
+export function setModelsListCache(text: string): void {
+  rawCacheSet(modelsListCache, MODELS_LIST_CACHE_KEY, text)
+}
+
+export function getCacheEntries(): CacheEntryView[] {
+  const now = Date.now()
+  const views: CacheEntryView[] = []
+  for (const reg of cacheRegistry) {
+    const entry = reg.cache.get(reg.key)
+    if (!entry) continue
+    if (now - entry.at > CACHE_TTL_MS) {
+      reg.cache.delete(reg.key)
+      continue
+    }
+    views.push({
+      key: reg.key,
+      label: reg.label,
+      size: new TextEncoder().encode(entry.text).length,
+      ageMs: now - entry.at,
+      ttlMs: CACHE_TTL_MS,
+    })
+  }
+  return views
+}
+
+/** 删除指定缓存项，不存在返回 false */
+export function deleteCacheEntry(key: string): boolean {
+  for (const reg of cacheRegistry) {
+    if (reg.key === key && reg.cache.has(key)) {
+      reg.cache.delete(key)
+      return true
+    }
+  }
+  return false
+}
+
+/** 清空全部缓存，返回清理的条目数 */
+export function clearCache(): { cleared: number; total: number } {
+  const total = cacheRegistry.length
+  let cleared = 0
+  for (const reg of cacheRegistry) {
+    if (reg.cache.delete(reg.key)) cleared++
+  }
+  return { cleared, total }
+}
+
+/** 安全 JSON.parse：KV 数据损坏 / 结构不符时回退默认值，避免连锁 500（R7） */
+function safeParseArray<T>(text: string | null | undefined, fallback: T[]): T[] {
+  if (!text) return fallback
+  try {
+    const parsed: unknown = JSON.parse(text)
+    return Array.isArray(parsed) ? (parsed as T[]) : fallback
+  } catch {
+    return fallback
+  }
+}
+
+// ===== 提供商 CRUD =====
+
+export async function getProviders(env: Env): Promise<Provider[]> {
+  const cached = rawCacheGet(providersCache, KV_KEYS.PROVIDERS)
+  if (cached !== undefined) return safeParseArray<Provider>(cached, [])
+  return getProvidersFresh(env)
+}
+
+/** 绕过内存缓存直读 KV 并刷新本地缓存（写路径用，避免基于过期缓存读-改-写丢更新）。 */
+export async function getProvidersFresh(env: Env): Promise<Provider[]> {
+  const data = await env.KV.get(KV_KEYS.PROVIDERS)
+  const providers = safeParseArray<Provider>(data, [])
+  rawCacheSet(providersCache, KV_KEYS.PROVIDERS, JSON.stringify(providers))
+  return providers
+}
+
+export async function getProvider(env: Env, id: string): Promise<Provider | null> {
+  const providers = await getProviders(env)
+  return providers.find((p) => p.id === id) ?? null
+}
+
+export async function setProviders(env: Env, providers: Provider[]): Promise<void> {
+  const text = JSON.stringify(providers)
+  await env.KV.put(KV_KEYS.PROVIDERS, text)
+  rawCacheSet(providersCache, KV_KEYS.PROVIDERS, text)
+}
+
+export async function addProvider(env: Env, provider: Provider): Promise<void> {
+  const providers = await getProvidersFresh(env)
+  providers.push(provider)
+  await setProviders(env, providers)
+}
+
+export async function updateProvider(env: Env, id: string, updates: Partial<Provider>): Promise<Provider | null> {
+  const providers = await getProvidersFresh(env)
+  const index = providers.findIndex((p) => p.id === id)
+  if (index === -1) return null
+  providers[index] = { ...providers[index], ...updates, updatedAt: new Date().toISOString() }
+  await setProviders(env, providers)
+  return providers[index]
+}
+
+export async function deleteProvider(env: Env, id: string): Promise<boolean> {
+  const providers = await getProvidersFresh(env)
+  const filtered = providers.filter((p) => p.id !== id)
+  if (filtered.length === providers.length) return false
+  await setProviders(env, filtered)
+  return true
+}
+
+// ===== 登录失败限速（S8c）=====
+const LOGIN_ATTEMPT_TTL = 5 * 60 // 窗口 5 分钟
+const LOGIN_ATTEMPT_MAX = 5 // 窗口内最多失败次数
+const loginRateKey = (ip: string) => `${KV_KEYS.LOGIN_RATE}${ip}`
+
+/**
+ * 记录一次登录失败，返回是否应拒绝（true = 已超过阈值，锁 5 分钟）。
+ * 计数存 KV，键带 TTL 自动过期，窗口内累计失败 ≥5 次即锁定该 IP。
+ */
+export async function recordLoginFailure(env: Env, ip: string): Promise<boolean> {
+  const key = loginRateKey(ip)
+  const raw = await env.KV.get(key)
+  const count = raw ? (parseInt(raw, 10) || 0) : 0
+  const next = count + 1
+  await env.KV.put(key, String(next), { expirationTtl: LOGIN_ATTEMPT_TTL })
+  return next >= LOGIN_ATTEMPT_MAX
+}
+
+/** 登录成功 / 明确拒绝前，清掉该 IP 的历史失败计数 */
+export async function resetLoginFailures(env: Env, ip: string): Promise<void> {
+  await env.KV.delete(loginRateKey(ip))
+}
+
+/** 查询某 IP 当前失败计数（用于锁定提示文案） */
+export async function getLoginFailureCount(env: Env, ip: string): Promise<number> {
+  const raw = await env.KV.get(loginRateKey(ip))
+  return raw ? (parseInt(raw, 10) || 0) : 0
+}
+
+// ===== Session 管理 =====
+
+export async function createSession(env: Env, username: string, ttlSeconds: number): Promise<string> {
+  const sessionId = crypto.randomUUID()
+  const session: Session = {
+    username,
+    expiresAt: Date.now() + ttlSeconds * 1000,
+  }
+  await env.KV.put(KV_KEYS.SESSION_PREFIX + sessionId, JSON.stringify(session), {
+    expirationTtl: ttlSeconds,
+  })
+  return sessionId
+}
+
+export async function getSession(env: Env, sessionId: string): Promise<Session | null> {
+  const data = await env.KV.get(KV_KEYS.SESSION_PREFIX + sessionId)
+  if (!data) return null
+  let session: Session | null = null
+  try {
+    session = JSON.parse(data) as Session
+  } catch {
+    return null
+  }
+  if (!session || typeof session.expiresAt !== 'number' || session.expiresAt < Date.now()) {
+    await deleteSession(env, sessionId)
+    return null
+  }
+  return session
+}
+
+export async function deleteSession(env: Env, sessionId: string): Promise<void> {
+  await env.KV.delete(KV_KEYS.SESSION_PREFIX + sessionId)
+}
+
+// ===== Responses 多轮记忆（G5：previous_response_id 解析历史） =====
+// 每次 Responses 完成后，把「已解析历史 + 本次输入 + 助手输出」按 response.id 存入 KV（带 TTL）。
+// 下次客户端用 previous_response_id 引用时，把该历史追加回 messages，实现多轮上下文的存续。
+const RESPONSES_HISTORY_TTL = 2 * 60 * 60 // 与 M365 convCache TTL(2h) 对齐
+
+/** 历史体含租户归属（v2）。旧条目是裸数组（v1，无归属），读取时按 legacy 放行。 */
+interface ResponseHistoryEnvelope {
+  v: 2
+  /** 调用方 API Key 哈希；空串表示未启用鉴权的部署 */
+  t: string
+  m: unknown[]
+}
+
+export async function saveResponseHistory(env: Env, responseId: string, messages: unknown[], tenant = ''): Promise<void> {
+  if (!responseId) return
+  try {
+    const envelope: ResponseHistoryEnvelope = { v: 2, t: tenant, m: messages || [] }
+    await env.KV.put(KV_KEYS.RESPONSES_PREFIX + responseId, JSON.stringify(envelope), {
+      expirationTtl: RESPONSES_HISTORY_TTL,
+    })
+  } catch { /* 记忆保存失败不影响响应 */ }
+}
+
+export async function getResponseHistory(env: Env, responseId: string, tenant = ''): Promise<unknown[] | null> {
+  if (!responseId) return null
+  try {
+    const raw = await env.KV.get(KV_KEYS.RESPONSES_PREFIX + responseId)
+    if (!raw) return null
+    const parsed: unknown = JSON.parse(raw)
+    // v1 legacy：裸数组，无租户归属，无法判定归属故放行（旧条目最多存活 2h）
+    if (Array.isArray(parsed)) return parsed
+    const env2 = parsed as Partial<ResponseHistoryEnvelope> | null
+    if (!env2 || env2.v !== 2 || !Array.isArray(env2.m)) return null
+    // 租户不匹配一律按不存在处理（不区分 404 与 403，避免泄漏 response.id 是否存在）
+    if (String(env2.t ?? '') !== tenant) return null
+    return env2.m
+  } catch { return null }
+}
+
+// ===== Responses 别名强约束（对齐 M365-Gateway RESPONSE_ALIAS 语义） =====
+// 目标：previous_response_id 是**不可变分支点**——重复引用同一别名会派生独立分支而非改写原别名；
+// 已消费的 call_id 拒绝再次提交，防止重复执行有副作用工具；别名与消费表均带 TTL 与个数上限。
+export const RESPONSE_ALIAS_TTL_SECONDS = 7 * 24 * 60 * 60 // 7 天（同原版 RESPONSE_ALIAS_TTL_MS）
+export const MAX_RESPONSE_ALIASES_PER_SESSION = 64
+export const MAX_CONSUMED_CALL_IDS = 512
+
+export interface ResponseAliasMeta {
+  /** 别名指向的会话/响应，本次引用会据此派生分支 */
+  sourceResponseId: string
+  createdAt: number
+  /** 已消费的 tool call_id 列表（一次性：提交过 tool 结果后不得再提交） */
+  consumedCallIds: string[]
+  /**
+   * 所属租户（调用方 API Key 哈希）。写入时必填；读取时若与调用方租户不符按不存在处理。
+   * 旧条目缺失该字段 → 视为 legacy 放行（旧别名最多存活 7 天）。
+   */
+  tenant?: string
+}
+
+export async function saveResponseAlias(env: Env, responseId: string, meta: ResponseAliasMeta, tenant = ''): Promise<void> {
+  if (!responseId) return
+  try {
+    // 别名不可变：已存在则不覆盖（分支点一旦确定，后续只能派生新分支）
+    const existing = await env.KV.get(KV_KEYS.RESPONSES_ALIAS_PREFIX + responseId)
+    if (existing) return
+    const bounded: ResponseAliasMeta = {
+      sourceResponseId: meta.sourceResponseId,
+      createdAt: meta.createdAt,
+      consumedCallIds: (meta.consumedCallIds || []).slice(-MAX_CONSUMED_CALL_IDS),
+      tenant: meta.tenant ?? tenant,
+    }
+    await env.KV.put(KV_KEYS.RESPONSES_ALIAS_PREFIX + responseId, JSON.stringify(bounded), {
+      expirationTtl: RESPONSE_ALIAS_TTL_SECONDS,
+    })
+  } catch { /* 别名保存失败不影响响应 */ }
+}
+
+export async function getResponseAlias(env: Env, responseId: string, tenant = ''): Promise<ResponseAliasMeta | null> {
+  if (!responseId) return null
+  try {
+    const raw = await env.KV.get(KV_KEYS.RESPONSES_ALIAS_PREFIX + responseId)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as ResponseAliasMeta
+    if (!parsed || typeof parsed !== 'object') return null
+    const owner = typeof parsed.tenant === 'string' ? parsed.tenant : null
+    // 有归属则必须匹配；legacy（无 tenant 字段）放行以兼容旧条目
+    if (owner !== null && owner !== tenant) return null
+    return {
+      sourceResponseId: String(parsed.sourceResponseId || responseId),
+      createdAt: Number(parsed.createdAt) || 0,
+      consumedCallIds: Array.isArray(parsed.consumedCallIds) ? parsed.consumedCallIds.map(String) : [],
+      tenant: owner ?? undefined,
+    }
+  } catch { return null }
+}
+
+/**
+ * 消费一个 tool call_id（一次性）。返回 false 表示该 call_id 已被消费过，
+ * 调用方应返回 409 tool_output_already_consumed，避免重复执行有副作用的工具。
+ */
+export async function consumeResponseCallId(env: Env, responseId: string, callId: string, tenant = ''): Promise<boolean> {
+  if (!responseId || !callId) return true
+  try {
+    const alias = await getResponseAlias(env, responseId, tenant)
+    if (!alias) return true
+    if (alias.consumedCallIds.includes(callId)) return false
+    alias.consumedCallIds = [...alias.consumedCallIds, callId].slice(-MAX_CONSUMED_CALL_IDS)
+    // 消费表更新采用就地覆盖（与别名"不可变分支点"互不冲突：只追加消费记录）
+    await env.KV.put(KV_KEYS.RESPONSES_ALIAS_PREFIX + responseId, JSON.stringify({ ...alias, tenant: alias.tenant ?? tenant }), {
+      expirationTtl: RESPONSE_ALIAS_TTL_SECONDS,
+    })
+    return true
+  } catch {
+    // 消费表故障时放行（不能因记录失败阻断正常请求），但已记录场景仍会拒绝
+    return true
+  }
+}
+
+// ===== 转发 Key =====
+
+export async function getProxyKeys(env: Env): Promise<ProxyKey[]> {
+  const cached = rawCacheGet(proxyKeysCache, KV_KEYS.PROXY_KEYS)
+  if (cached !== undefined) return safeParseArray<ProxyKey>(cached, [])
+  const data = await env.KV.get(KV_KEYS.PROXY_KEYS)
+  if (data !== null) rawCacheSet(proxyKeysCache, KV_KEYS.PROXY_KEYS, data)
+  return safeParseArray<ProxyKey>(data, [])
+}
+
+export async function setProxyKeys(env: Env, keys: ProxyKey[]): Promise<void> {
+  const text = JSON.stringify(keys)
+  await env.KV.put(KV_KEYS.PROXY_KEYS, text)
+  rawCacheSet(proxyKeysCache, KV_KEYS.PROXY_KEYS, text)
+}
+
+export async function addProxyKey(env: Env, key: ProxyKey): Promise<void> {
+  const keys = await getProxyKeys(env)
+  keys.push(key)
+  await setProxyKeys(env, keys)
+}
+
+export async function deleteProxyKey(env: Env, id: string): Promise<boolean> {
+  const keys = await getProxyKeys(env)
+  const filtered = keys.filter((k) => k.id !== id)
+  if (filtered.length === keys.length) return false
+  await setProxyKeys(env, filtered)
+  return true
+}
+
+export async function updateProxyKey(env: Env, id: string, updates: Partial<ProxyKey>): Promise<ProxyKey | null> {
+  const keys = await getProxyKeys(env)
+  const idx = keys.findIndex(k => k.id === id)
+  if (idx === -1) return null
+  keys[idx] = { ...keys[idx], ...updates }
+  await setProxyKeys(env, keys)
+  return keys[idx]
+}
+
+export async function getValidProxyKey(env: Env, key: string): Promise<ProxyKey | null> {
+  const keys = await getProxyKeys(env)
+  const found = keys.find((k) => {
+    if (k.key !== key || !k.enabled) return false
+    if (k.expiresAt) {
+      const now = Date.now()
+      const expires = new Date(k.expiresAt).getTime()
+      if (now >= expires) return false
+    }
+    return true
+  })
+  return found || null
+}
+
+// ===== 初始数据填充 =====
+
+import { DEFAULT_PROVIDERS, PROXY_KEY_PREFIX } from './config'
+
+/**
+ * 首次请求时补齐默认数据：
+ *  1. 没有任何 provider → 落一份空的 WorkBuddy 账号池（端点已预填，登录即可用）；
+ *  2. 没有任何转发 Key → 生成一个可直接使用的「测试 Key」。
+ *
+ * 只补齐一次，之后用户手动删除的默认项不会被自动加回。
+ */
+export async function seedInitialData(env: Env): Promise<void> {
+  const providers = await getProviders(env)
+  if (providers.length === 0) {
+    await setProviders(
+      env,
+      DEFAULT_PROVIDERS.map((p) => ({
+        ...p,
+        apiKeys: [],
+        models: [],
+      }))
+    )
+  }
+
+  const keys = await getProxyKeys(env)
+  if (keys.length === 0) {
+    const testKey = {
+      id: crypto.randomUUID(),
+      key: `${PROXY_KEY_PREFIX}${crypto.randomUUID().replace(/-/g, '').substring(0, 16)}`,
+      name: '测试 Key',
+      enabled: true,
+      createdAt: new Date().toISOString(),
+    }
+    await addProxyKey(env, testKey)
+  }
+}

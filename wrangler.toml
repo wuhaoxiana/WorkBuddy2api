@@ -1,0 +1,45 @@
+name = "workbuddy-2api"
+main = "src/index.ts"
+compatibility_date = "2025-07-01"
+compatibility_flags = ["nodejs_compat"]
+keep_vars = true
+
+# Workers Paid：把单请求活跃 CPU 上限从默认 30s 提到 5 分钟（300000ms）。
+# 主动计算时间（SSE 解析/序列化等）才算 CPU，等网络 I/O 不计入；墙钟本来就无限。
+# 仅 Paid 生效，Free 固定 10ms 无法提高。
+[limits]
+cpu_ms = 300_000
+
+# Smart Placement：把 Worker 执行点调度到离上游（copilot.tencent.com / www.workbuddy.ai）更近的
+# Cloudflare 节点，降低 SSE 首字节延迟。
+[placement]
+mode = "smart"
+
+# KV namespace —— wrangler 按 name 自动解析
+[[kv_namespaces]]
+binding = "KV"
+
+# Analytics Engine 数据集 —— 记录代理请求用量（不绑定时统计看板自动降级为空数据）
+[[analytics_engine_datasets]]
+binding = "USAGE_ANALYTICS"
+dataset = "workbuddy_usage"
+
+[vars]
+USAGE_ANALYTICS_DATASET = "workbuddy_usage"
+
+# 定时任务（时间均为 UTC，括号内为北京时间）：
+#   "0 */2 * * *"   —— 每 2 小时刷新账号池内 Token（保活 + 临期续期）
+#   "5 2,14 * * *"  —— 每日 10:05 / 22:05 自动签到（含活跃上报、猫猫旅行、盲盒、连登奖励）
+#   "30 15 * * *"   —— 每日 23:30 夜猫子任务（官方只在 CST 23:00–08:00 窗口内计数）
+[triggers]
+crons = ["0 */2 * * *", "5 2,14 * * *", "30 15 * * *"]
+
+# ===== 以下变量在 Cloudflare Dashboard → Workers → Variables 配置 =====
+# ADMIN_USERNAME = "admin"
+# ADMIN_PASSWORD = "your-password"
+# MANAGEMENT_TOKEN = "对外管理 API (/api/manage/*) 的 Bearer Token；不配置则该 API 返回 503"
+#
+# Cloudflare Access 加固（可选，仅作用于管理后台 /admin/*，不影响客户端 /v1/*）：
+# CF_ACCESS_ENABLED = "true"
+# CF_ACCESS_AUD = "你的 Access 应用 AUD"
+# CF_ACCESS_TEAM_DOMAIN = "你的团队域名.cloudflareaccess.com"

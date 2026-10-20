@@ -1,0 +1,33 @@
+{
+  "name": "workbuddy-2api",
+  "version": "1.0.0",
+  "description": "WorkBuddy / CodeBuddy API Gateway on Cloudflare Workers — 多账号池 + 签到生态 + OpenAI/Anthropic 双协议",
+  "main": "src/index.ts",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build": "wrangler deploy --dry-run",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "workbuddy",
+    "codebuddy",
+    "ai-gateway",
+    "openai",
+    "anthropic"
+  ],
+  "license": "Apache-2.0",
+  "dependencies": {
+    "hono": "^4.13.5"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "4.20260702.1",
+    "typescript": "6.0.3",
+    "vitest": "4.1.11",
+    "wrangler": "4.107.0"
+  }
+}

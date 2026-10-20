@@ -1,0 +1,41 @@
+name: Deploy to Cloudflare Workers
+
+# 自动部署：push 到 main 分支即触发；也可在 Actions 页面手动 Run workflow
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# 最小权限：仅读取仓库内容即可完成构建与部署
+permissions:
+  contents: read
+
+# 需要的 Secrets:
+#   CF_API_TOKEN   - Cloudflare API Token（权限：Workers Scripts Edit）
+#   CF_ACCOUNT_ID  - Cloudflare Account ID
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        # .npmrc 已声明 legacy-peer-deps（见文件内注释）；ci 失败时回退 install 保证能出包
+        run: npm ci || npm install
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: npx vitest run
+
+      - name: Deploy to Cloudflare Workers
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}

@@ -1,0 +1,4028 @@
+import { Context } from 'hono'
+import { getProvider, getProviders, getModelsListCache, setModelsListCache, resolveProviderBaseUrl, getResponseHistory, saveResponseHistory } from './storage'
+import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES, OAUTH_TOKEN_REFRESH_MARGIN_MS } from './config'
+import type { AppEnv, Env, ProxyRequestBody } from './types'
+import { RequestBodyError, readJSONLimited, MAX_AI_REQUEST_BYTES, MAX_RESPONSES_REQUEST_BYTES } from './request-body'
+import { createAnalyticsContext, normalizeAnthropicUsage, normalizeChatUsage, normalizeResponsesUsage, summarizeError } from './analytics/types'
+import type { AnalyticsContext, UsageMetrics } from './analytics/types'
+import { createStreamUsageProbe, writeAnalyticsEvent } from './analytics/usage-logger'
+import { writeLog } from './admin'
+import { getPerfSettings } from './perf'
+import { applyThinkingInjection } from './thinking'
+import { applyCachePrefixInjection } from './cache-prefix'
+import { getOauthAccessToken, readOauthToken, refreshOauthToken, detectTokenRealm, buildOauthHeaders } from './oauth'
+import {
+  cooldownOauthAccount,
+  cooldownOauthAccountSoftForModel,
+  cooldownOauthAccountUntilTomorrow4AM,
+  disableOauthAccount,
+  isOAuthPoolProvider,
+  noteOauthError,
+  noteOauthSuccess,
+  noteOauthSessionDead,
+  clearOauthSessionDead,
+  clearOauthAccountModelCooldown,
+  recordOauthModelCost,
+  pickOauthAccount,
+  refreshOauthPoolAccount,
+  resolveOauthCooldown,
+  seedOauthPoolFromSingle,
+  readOauthPool,
+  isOauthAccountHealthy,
+  type OAuthPoolAccount,
+} from './oauth-pool'
+import {
+  applyWorkbuddyReasoningEffort,
+  captureWorkbuddyReasoningEffort,
+  classifyWorkbuddyUpstreamError,
+  parseSoftRateReset,
+  injectDeepSeekThinking,
+  backfillReasoningContent,
+  injectWorkbuddyChatHeaders,
+  ensureWorkbuddyStreamOptions,
+  ensureWorkbuddyMaxTokens,
+  normalizeWorkbuddyImageURL,
+  isAccountBanned,
+  ensureGlobalFallbackSystem,
+  rewriteWorkbuddySystemPrompt,
+  appendWorkbuddySystemPrompt,
+  WORKBUDDY_DEGRADED_PROMPT,
+  sanitizeWorkbuddyMessages,
+  sanitizeFingerprintText,
+  ContentBlockedError,
+  WorkbuddyClientError,
+  formatWorkbuddyClientErrorMessage,
+  rotateBackoffAfterMs,
+  isWafBlocked,
+  parseRetryAfterMs,
+  RETRY_AFTER_SANITY_MS,
+} from './workbuddy-upstream'
+import {
+  buildChatMeta,
+  extractSessionKey,
+  stickyFallbackKey,
+  type ChatMeta,
+} from './workbuddy-session-ids'
+import {
+  resolveSticky,
+  bindSticky,
+  unbindSticky,
+} from './workbuddy-sticky'
+import { createWorkbuddyChunkCleaner, sanitizeWorkbuddyErrorFrame, WORKBUDDY_EMPTY_STREAM_FRAME, WORKBUDDY_HINT_INVALID_IMAGE, type WorkbuddyChunkCleaner, type WorkbuddyErrorFrame } from './workbuddy-sse'
+import { probeWorkbuddyModelCatalog, getCachedWorkbuddyEfforts } from './workbuddy-models'
+import {
+  acquireInFlight,
+  releaseInFlight,
+  isInFlightFull,
+  resolveMaxInFlight,
+  resolveMaxInFlightGlobal,
+} from './workbuddy-inflight'
+import {
+  anthropicToOpenAI,
+  createAnthropicSSEAccumulator,
+  openAIChunkToAnthropicSSE,
+  aggregateOpenAIToAnthropic,
+  responsesToOpenAI,
+  openAIChunkToResponsesSSE,
+  buildResponsesFallbackCompleted,
+  responsesOutputToAssistantMessage,
+  aggregateOpenAIToResponses,
+  finalizeAnthropicStream,
+  diagnoseAnthropicAccumulator,
+  openAIRequestToAnthropic,
+  anthropicResponseToOpenAI,
+  anthropicResponseToResponses,
+  createAnthropicSSEToOpenAI,
+  createAnthropicSSEToResponses,
+} from './formats'
+
+// ===== 通用流式传输辅助（本文件内实现，供 fetch 超时 / SSE 心跳 / idle 兜底复用）=====
+
+/** 流式上游 fetch 的连接/首字节超时：思考模型首字节前可能长时间无输出，放宽到 90s。 */
+const SSE_CONNECT_TIMEOUT_MS = 90000
+/** 流式期间上游完全无数据的最长容忍时间（防止挂死），正常思考持续输出不会触发。 */
+const SSE_STREAM_IDLE_TIMEOUT_MS = 240000
+
+/** 流式结束态：complete=上游自然读完 / idle=空闲超时结束 / cancel=客户端断开 / error=读 body 异常 */
+type StreamCloseReason = 'complete' | 'idle' | 'cancel' | 'error'
+
+/**
+ * 包装上游 SSE 流：
+ * 1. 心跳（keepAliveMs > 0 时启用）：距上次输出超过 keepAliveMs 时向客户端注入
+ *    `: keep-alive\n\n` 注释行。SSE 注释行客户端会忽略但能重置 idle 计时器。
+ * 2. idle 兜底：上游超过 idleTimeoutMs 无任何数据时主动结束流，防止无限挂起。
+ */
+function withSSEKeepAlive(
+  body: ReadableStream<Uint8Array>,
+  keepAliveMs: number,
+  idleTimeoutMs: number,
+  onClose?: (reason: StreamCloseReason) => void
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader()
+  const encoder = new TextEncoder()
+  let closed = false
+  let lastOutputAt = Date.now()
+
+  const notify = (reason: StreamCloseReason) => {
+    if (!onClose) return
+    try { onClose(reason) } catch { /* 回调异常不影响流收尾 */ }
+  }
+
+  const finish = (controller: ReadableStreamDefaultController<Uint8Array>, reason: StreamCloseReason) => {
+    if (closed) return
+    closed = true
+    try { controller.close() } catch { /* ignore */ }
+    reader.cancel().catch(() => { /* ignore */ })
+    notify(reason)
+  }
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      let idleTimer: ReturnType<typeof setTimeout> | null = null
+      let heartbeatTimer: ReturnType<typeof setTimeout> | null = null
+
+      const armIdle = () => {
+        if (idleTimer) clearTimeout(idleTimer)
+        idleTimer = setTimeout(() => finish(controller, 'idle'), idleTimeoutMs)
+      }
+      const armHeartbeat = () => {
+        if (keepAliveMs <= 0) return
+        if (heartbeatTimer) clearTimeout(heartbeatTimer)
+        heartbeatTimer = setTimeout(() => {
+          if (closed) return
+          const now = Date.now()
+          if (now - lastOutputAt >= keepAliveMs) {
+            try { controller.enqueue(encoder.encode(': keep-alive\n\n')) } catch { /* ignore */ }
+            lastOutputAt = Date.now()
+          }
+          armHeartbeat()
+        }, keepAliveMs)
+      }
+
+      armIdle()
+      armHeartbeat()
+
+      let readError = false
+      try {
+        while (!closed) {
+          const { done, value } = await reader.read()
+          if (done) break
+          lastOutputAt = Date.now()
+          armIdle()
+          controller.enqueue(value)
+        }
+      } catch { /* abort / 读错误：结束流 */ readError = true }
+      // 自然 EOF 为 complete；读 body 抛错为 error
+      finish(controller, readError ? 'error' : 'complete')
+    },
+    cancel() {
+      if (closed) return
+      closed = true
+      reader.cancel().catch(() => { /* ignore */ })
+      notify('cancel')
+    },
+  })
+}
+
+/**
+ * 通用流式上游 fetch：连接/首字节超时（默认 90s），拿到 response 后解除整体超时；
+ * body 包 withSSEKeepAlive（idle 兜底 + 可选心跳）。keepAliveMs 默认 0（不注入心跳注释行，
+ * 避免干扰各私有 SSE 解析器）；需要防客户端 idle 断流的路径显式传心跳阈值。
+ */
+async function streamFetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  opts?: { connectTimeoutMs?: number; idleTimeoutMs?: number; keepAliveMs?: number; signal?: AbortSignal },
+): Promise<Response> {
+  const connectTimeoutMs = opts?.connectTimeoutMs ?? SSE_CONNECT_TIMEOUT_MS
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), connectTimeoutMs)
+  // 外部信号（入站请求）联动：客户端断开时立刻中止上游 fetch，
+  // 否则 Workers 侧会继续把这一轮读完（上游白烧、网关侧还会当成模型故障去罚冷却）。
+  const outer = opts?.signal
+  const onOuterAbort = () => controller.abort(outer?.reason)
+  if (outer) {
+    if (outer.aborted) controller.abort(outer.reason)
+    else outer.addEventListener('abort', onOuterAbort, { once: true })
+  }
+  const detach = () => outer?.removeEventListener('abort', onOuterAbort)
+  let response: Response
+  try {
+    response = await fetch(url, { ...init, signal: controller.signal })
+  } catch (err) {
+    clearTimeout(timer)
+    detach()
+    throw err
+  }
+  clearTimeout(timer)
+  detach()
+  if (response.body) {
+    // 心跳注释行只对严格 SSE（text/event-stream）注入；NDJSON 等格式注入会破坏逐行解析
+    const isEventStream = (response.headers.get('content-type') || '').toLowerCase().includes('text/event-stream')
+    const body = withSSEKeepAlive(
+      response.body,
+      isEventStream ? (opts?.keepAliveMs ?? 0) : 0,
+      opts?.idleTimeoutMs ?? SSE_STREAM_IDLE_TIMEOUT_MS,
+    )
+    return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers })
+  }
+  return response
+}
+
+// ===== Key 健康状态类型和辅助函数 =====
+
+interface KeyHealth {
+  failures: number
+  lastFailed: boolean
+  demotedAt?: number  // 首次达到降权阈值的时间戳 (Date.now())
+}
+type HealthMap = Record<string, KeyHealth>
+
+// 转换后 SSE 流（Anthropic/Responses）统一心跳配置：距上次输出超过 8s 注入
+// `: keep-alive\n\n` 注释行，防客户端（AI SDK / iOS 严格解析器，常见 ~15s 空闲超时）
+// 在模型静默期判定流结束而截断回答；上游超过 180s 完全无数据视为挂起，主动结束流。
+const SSE_KEEPALIVE_MS = 8000
+const SSE_IDLE_TIMEOUT_MS = 180000
+
+const HEALTH_KEY = (providerId: string) => KV_KEYS.KEY_HEALTH_PREFIX + providerId
+
+// R1：health 读写缓存。同一 isolate 内并发请求共享同一 healthMap 对象（10s TTL），
+// 消除「readHealth → failures++ → writeHealth 整条覆盖写」并发时的计数互相覆盖。
+// 跨 isolate 的极端并发仍受 KV 无原子增量限制，但失败计数失陪几秒可接受。
+const HEALTH_CACHE_TTL_MS = 10_000
+interface HealthCacheEntry { map: HealthMap | null; at: number }
+const healthCache = new Map<string, HealthCacheEntry>()
+
+async function readHealth(env: Env, providerId: string): Promise<HealthMap> {
+  const key = HEALTH_KEY(providerId)
+  const cache = healthCache.get(key)
+  if (cache && Date.now() - cache.at < HEALTH_CACHE_TTL_MS) {
+    return cache.map || {}
+  }
+  const raw = await env.KV.get(key)
+  const map: HealthMap = raw ? JSON.parse(raw) : {}
+  healthCache.set(key, { map, at: Date.now() })
+  return map
+}
+
+async function writeHealth(env: Env, providerId: string, health: HealthMap): Promise<void> {
+  // 只保存有失败记录的 key，避免 KV 膨胀
+  const filtered: HealthMap = {}
+  for (const [k, v] of Object.entries(health)) {
+    if (v.failures > 0) filtered[k] = v
+  }
+  const key = HEALTH_KEY(providerId)
+  if (Object.keys(filtered).length > 0) {
+    await env.KV.put(key, JSON.stringify(filtered))
+    healthCache.set(key, { map: filtered, at: Date.now() })
+  } else {
+    // 全部健康，删除 KV 条目
+    await env.KV.delete(key).catch(() => {})
+    healthCache.set(key, { map: null, at: Date.now() })
+  }
+}
+
+/** 解析模型 ID，如 "deepseek/deepseek-chat" → { providerId, modelId } */
+function parseModelId(model: string): { providerId: string; modelId: string } | null {
+  const slashIndex = model.indexOf('/')
+  if (slashIndex === -1) return null
+  return {
+    providerId: model.substring(0, slashIndex),
+    modelId: model.substring(slashIndex + 1),
+  }
+}
+
+/** 生成请求体摘要：保留顶层字段名和结构，但截断 messages 内容 */
+function summarizeRequestBody(body: Record<string, unknown>): Record<string, unknown> {
+  try {
+    const summary: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(body)) {
+      if (key === 'messages' && Array.isArray(value)) {
+        summary[key] = value.map((msg: any) => {
+          if (!msg || typeof msg !== 'object') return String(msg)
+          const entry: Record<string, unknown> = { role: msg.role || 'unknown' }
+          if (typeof msg.content === 'string') {
+            entry.content_length = msg.content.length
+          } else if (Array.isArray(msg.content)) {
+            entry.content_blocks = msg.content.length
+            // 记录每个 block 的类型和文本预览，便于定位上游不支持的 block 类型
+            entry.block_types = msg.content.map((b: any) => {
+              if (!b || typeof b !== 'object') return String(b)
+              const t = b.type || 'unknown'
+              const txt = (typeof b.text === 'string' ? b.text : b.output ? String(b.output) : '').slice(0, 50)
+              return txt ? `${t}:${txt}` : t
+            })
+          }
+          if (Array.isArray(msg.tool_calls)) entry.tool_calls_count = msg.tool_calls.length
+          if (typeof msg.tool_call_id === 'string') entry.tool_call_id = msg.tool_call_id
+          return entry
+        })
+      } else if (key === 'tools' && Array.isArray(value)) {
+        summary[key] = value.map((t: any) => (t && t.function ? { name: t.function.name } : String(t)))
+      } else {
+        summary[key] = value
+      }
+    }
+    return summary
+  } catch {
+    return { _error: 'summarize failed', keys: Object.keys(body) }
+  }
+}
+
+/**
+ * 清洗上游错误文本后再回显给客户端（S8）：
+ * - 截断到安全长度，避免上游返回超大/恶意 body 时整段回显
+ * - 仅保留可打印 ASCII 与常见 CJK，剥离控制字符/转义序列（防终端注入与日志逃逸）
+ * - 移除疑似内网/元数据地址与「Authorization/Bearer」等敏感字样的裸露段
+ */
+function sanitizeUpstreamError(text: string, max = 400): string {
+  const raw = String(text || '')
+  const noControl = raw.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+  const cleaned = noControl
+    .replace(/https?:\/\/(?:[0-9]{1,3}\.){3}[0-9]{1,3}[^\s'"]*/gi, '')
+    .replace(/https?:\/\/(?:localhost|127\.0\.0\.1|10\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.)[^\s'"]*/gi, '')
+    .replace(/(authorization|proxy-authorization|api[_-]?key|bearer)\s*[:=]\s*\S+/gi, '$1: ***')
+  return cleaned.slice(0, max)
+}
+
+/**
+ * 清理被 Tencent CodeBuddy 内容过滤器屏蔽的模板短语。
+ *
+ * 已升级为 workbuddy2api 的**完整脱敏管线**（sanitizeWorkbuddyMessages）：
+ * 除 content（字符串与多模态 text part）外，还净化 `tool_calls[].function.arguments`
+ * ——后者长期是盲区（工具调用消息 content 常为 null，旧实现遇 null 会跳过整条消息，
+ * 使工具参数里的被拦字符串原样漏出）。
+ */
+function sanitizeBlockedTemplates(body: Record<string, unknown>): void {
+  sanitizeWorkbuddyMessages(body)
+}
+
+/**
+ * 单段文本的模板短语净化。
+ *
+ * @deprecated 语义已被 `sanitizeFingerprintText`（workbuddy-upstream.ts）完整覆盖。
+ * 本包装保留以兼容既有调用点；新代码请直接用 `sanitizeFingerprintText`。
+ *
+ * 注意本函数此前用**零宽空格 `\u200B`** 打断匹配串，而 workbuddy2api 实测结论是
+ * "零宽空格无效（上游会归一化）"，对 `11128` 必须改用连字符。现委托给完整实现。
+ */
+function sanitizeText(s: string): string {
+  return sanitizeFingerprintText(s)
+}
+
+/**
+ * 清理上游不支持的请求体字段：
+ * - developer role → system（WorkBuddy 不支持 developer）
+ * - 删除 reasoning_effort（上游 OpenAI 兼容 API 不支持）
+ * - 空 content 数组 → 空字符串
+ */
+function sanitizeUpstreamBody(body: Record<string, unknown>): void {
+  delete body['__responses_parallel_tool_calls']
+  // 删除 reasoning_effort
+  delete body['reasoning_effort']
+  // 删除 thinking（Anthropic 专用字段；Procedural/OpenAI 兼容上游（如 Google Gemini OpenAI 端点）
+  // 不认识该字段，会返回 Invalid JSON payload Unknown name "thinking"）
+  if (body['thinking'] !== undefined) {
+    delete body['thinking']
+  }
+
+  const messages = body['messages'] as any[]
+  if (!Array.isArray(messages)) return
+  for (const msg of messages) {
+    if (!msg || typeof msg !== 'object') continue
+    // developer → system
+    if (msg.role === 'developer') {
+      msg.role = 'system'
+    }
+    // 空 content 数组 → 空字符串（OpenAI API 不接受 content: []）
+    if (Array.isArray(msg.content) && msg.content.length === 0) {
+      msg.content = ''
+    }
+  }
+}
+
+/**
+ * 是否为 WorkBuddy/CodeBuddy 提供商（browser 登录流，或 id 以 workbuddy 开头）。
+ * 上游 copilot.tencent.com 只支持流式、只接受字符串 tool_choice，且对 developer 角色敏感，
+ * 因此这类提供商在转发前需要额外的请求体改写（见 sanitizeUpstreamBody / normalizeOpenAIToolChoice）。
+ */
+function isWorkbuddyProvider(provider: { id?: string; authType?: string; oauth?: { flowType?: string } }): boolean {
+  return Boolean(
+    (provider.authType === 'oauth-device' && provider.oauth?.flowType === 'browser') ||
+    (typeof provider.id === 'string' && provider.id.startsWith('workbuddy'))
+  )
+}
+
+/**
+ * 归一化 OpenAI tool_choice（对齐 traework2api / workbuddy-wild 的 PrepareBody 不变量）：
+ * WorkBuddy 上游只接受字符串形式，对象形式会 400 code=11101。
+ *  - "none" / {"type":"none"} → 删 tool_choice + 删 tools/functions
+ *  - {"type":"auto"/"required"} → 字符串 "auto"/"required"
+ *  - {"type":"function","function":{"name":"x"}} → 字符串 "x"
+ *  - 其他对象/非标量 → 删 tool_choice
+ */
+function normalizeOpenAIToolChoice(body: Record<string, unknown>): void {
+  const tc = body['tool_choice']
+  if (tc === undefined) return
+  const suppressTools = () => {
+    delete body['tools']
+    delete body['functions']
+  }
+  if (typeof tc === 'string') {
+    if (tc.trim().toLowerCase() === 'none') {
+      delete body['tool_choice']
+      suppressTools()
+    }
+    return
+  }
+  if (tc && typeof tc === 'object' && !Array.isArray(tc)) {
+    const o = tc as Record<string, unknown>
+    const typ = typeof o['type'] === 'string' ? o['type'].trim().toLowerCase() : ''
+    switch (typ) {
+      case 'none':
+        delete body['tool_choice']
+        suppressTools()
+        break
+      case 'auto':
+      case 'required':
+        body['tool_choice'] = typ
+        break
+      case 'function': {
+        const fn = o['function'] as Record<string, unknown> | undefined
+        const name = (
+          fn && typeof fn === 'object' ? String(fn['name'] || '') : String(o['name'] || '')
+        ).trim()
+        body['tool_choice'] = name !== '' ? name : 'auto'
+        break
+      }
+      default:
+        delete body['tool_choice']
+    }
+    return
+  }
+  delete body['tool_choice']
+}
+
+/**
+ * WorkBuddy SSE 流聚合：收集所有 chunk 拼接为非流式 chat.completion 响应。
+ * 参考 cpa-plugin stream.go 的 aggregateCompletion 实现。
+ *
+ * 返回值是**判别联合**而非裸字符串：上游可在流中下发 `error` 帧（6004 限流 / 审核 /
+ * 会话失效）。此前该帧被 `chunk.choices` 为空的逻辑静默跳过，聚合结果是
+ * **200 + 空内容**——客户端既拿不到错误也拿不到内容，是最坏的失败形态。
+ * 现在显式区分：`ok:false` 时调用方按错误返回，不再产出假成功。
+ */
+type WorkbuddyAggregateResult =
+  | { ok: true; body: string }
+  | { ok: false; error: WorkbuddyErrorFrame }
+
+async function aggregateWorkbuddySSE(
+  body: ReadableStream<Uint8Array>,
+  model: string,
+  sanitizeError?: (text: string) => string,
+): Promise<WorkbuddyAggregateResult> {
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let content = '', reasoning = '', role = '', respModel = '', respID = '', finish = ''
+  let created = 0
+  let usage: Record<string, unknown> | null = null
+  /**
+   * 正文是否已采过**非空**内容（对齐源实现 `gotAnyContent`）。
+   * 非 delta 的 `choices[].message` 兜底分支受它守卫：一帧整条 message 之后不再拼接，
+   * 否则「每帧都带完整 message」的上游会把正文重复 N 遍（N = 帧数）。
+   * 置位只发生在 appendContent 内，且**空串不置位**（源 issue #142）。
+   */
+  let gotAnyContent = false
+  /**
+   * 正文唯一写入点（移植 workbuddy2api f2e51ab，对齐源 `appendContent`）。
+   *
+   * 两条采集路径（delta 分片 / 非 delta 整条 message）共用它，保证「空串不占 latch」
+   * 的口径只有一处定义：空串既无字节可追加，也不构成「已采到正文」。此前两处各自
+   * `if (typeof x === 'string') { content += x; gotAnyContent = true }`，空串同样置位
+   * （源 issue #142），使后续真正带正文的帧被 `!gotAnyContent` 守卫丢弃 → 200 + 空正文。
+   */
+  const appendContent = (txt: unknown) => {
+    if (typeof txt !== 'string' || txt === '') return
+    content += txt
+    gotAnyContent = true
+  }
+  /** 上游显式发过 `data: [DONE]`（正常收尾）。见 P1-2 截断判定。 */
+  let sawDone = false
+  const toolCalls: Map<number, Record<string, unknown>> = new Map()
+  const toolOrder: number[] = []
+  /** 缺 index 的 tool_call 的分配序号源：跨帧延续「最近分配」槽位，同帧内递增。 */
+  let toolSeq = 0
+  /** id → 已分配的 index：跨帧持续，供缺 index 时按 id 归位既有调用。 */
+  const idIndex = new Map<string, number>()
+  /** 流内首个上游错误帧（已脱敏）：聚合遇错即视为本请求失败 */
+  let streamError: WorkbuddyErrorFrame | undefined
+  /**
+   * 有效数据事件计数（移植 workbuddy2api 0a86854）：口径 = JSON 解析成功且为**对象**
+   * 的数据帧（对齐 Go 侧 `json.Unmarshal(..., &map[string]any)` 成功即计数；数组/标量
+   * 解不进 map，等价于解析失败）。`[DONE]` 与注释行不计。
+   */
+  let validEvents = 0
+
+  // 按 index 合并 tool_call delta
+  function mergeToolCallDelta(merged: Record<string, unknown>, delta: Record<string, unknown>) {
+    for (const k of ['id', 'type']) {
+      if (!(k in merged) && typeof delta[k] === 'string' && delta[k] !== '') {
+        merged[k] = delta[k]
+      }
+    }
+    // function.name 可能分片，拼接
+    if (delta.function && typeof delta.function === 'object') {
+      const df = delta.function as Record<string, unknown>
+      if (!merged.function) merged.function = {}
+      const mf = merged.function as Record<string, unknown>
+      if (typeof df.name === 'string') {
+        mf.name = (mf.name as string || '') + df.name
+      }
+      if (typeof df.arguments === 'string') {
+        mf.arguments = (mf.arguments as string || '') + df.arguments
+      }
+    }
+  }
+
+  /** 分配下一个不与既有槽冲突的缺 index 序号（跳过合规流已占用的 index）。 */
+  function nextToolIndex(): number {
+    for (;;) {
+      const idx = toolSeq++
+      if (!toolCalls.has(idx)) return idx
+    }
+  }
+
+  /**
+   * 把一段 tool_calls 数组按 index 合并进累计表（移植 workbuddy2api 5c2db2f，对齐源
+   * `mergeToolCallsChunk`）。delta（流式分片，按 index 累积）与非 delta 的完整 message
+   * 共用同一合并逻辑，保证「上游给的身份/函数名不丢、arguments 拼接语义一致」。
+   *
+   * index 缺失兼容：OpenAI 规范要求 delta 帧的 tool_call 带 index（标记分片归属），
+   * 但部分上游省略它。此前缺 index 一律归 0——多调用场景下不同 call 被合并进同一槽，
+   * arguments 串联污染（`{"a":1}{"b":2}`）、name 互相覆盖。分派规则（对齐源实现）：
+   *  - 带 index → 按 index 累积（合规形态，零改动）；
+   *  - 缺 index 带 id 且 id 已见过 → 归位该 id 所在 index（跨帧有效）；
+   *  - 缺 index 带 id 且 id 是新的 → 开新序号（多调用不合并）；
+   *  - 缺 index 无 id → 延续最近收到碎片的槽（单调用延续分片的标准形态），无既往开新号。
+   */
+  function mergeToolCallsChunk(tcs: unknown[]) {
+    for (const tc of tcs) {
+      if (!tc || typeof tc !== 'object') continue
+      const call = tc as Record<string, unknown>
+      let idx = -1
+      if (typeof call.index === 'number' && Number.isFinite(call.index)) {
+        idx = Math.trunc(call.index)
+      } else {
+        const cid = typeof call.id === 'string' ? call.id : ''
+        if (cid !== '') {
+          const mid = idIndex.get(cid)
+          idx = mid !== undefined ? mid : nextToolIndex()
+        } else if (toolOrder.length > 0) {
+          idx = toolOrder[toolOrder.length - 1]
+        } else {
+          idx = nextToolIndex()
+        }
+      }
+      if (!toolCalls.has(idx)) {
+        toolCalls.set(idx, { index: idx })
+        toolOrder.push(idx)
+      }
+      const merged = toolCalls.get(idx)!
+      const callId = typeof call.id === 'string' ? call.id : ''
+      if (callId !== '') idIndex.set(callId, idx)
+      const mergedId = typeof merged.id === 'string' ? merged.id : ''
+      if (mergedId !== '') idIndex.set(mergedId, idx)
+      mergeToolCallDelta(merged, call)
+    }
+  }
+
+  /**
+   * 把非 delta 的完整 `message` 内容并入聚合（移植 workbuddy2api 11b75d4，对齐源
+   * `mergeMessageFields`）。role/reasoning_content/tool_calls 与 delta 分支同构透出；
+   * content 同样置 `gotAnyContent`（latch 语义与 delta 路径一致：一帧整条 message
+   * 之后，后续帧不重复追加）。此前该兜底分支只取 content——tool_calls/role/
+   * reasoning_content 全丢（上游若用 message 形态下发正文与工具调用，整体被丢弃）。
+   */
+  function mergeMessageFields(msg: Record<string, unknown>) {
+    if (typeof msg.role === 'string' && msg.role !== '') role = msg.role
+    // 空串 content 不占 latch：appendContent 内部已排除空串（移植 94bc325 + f2e51ab）
+    if (typeof msg.content === 'string') appendContent(msg.content)
+    if (typeof msg.reasoning_content === 'string') reasoning += msg.reasoning_content
+    if (Array.isArray(msg.tool_calls)) mergeToolCallsChunk(msg.tool_calls)
+  }
+
+  /**
+   * 判断 tool_call 的 arguments 是否因分片丢失而残缺（移植 workbuddy2api 65b2f33，
+   * 对齐源 `isTruncatedArguments`）：
+   *  - 空串 / 纯空白 → false（合法无参工具）；
+   *  - 非空但 JSON 解析失败 → true（截断）；
+   *  - 能解析（含 null/标量/数组等任何合法 JSON）→ false。
+   */
+  function isTruncatedArguments(raw: string): boolean {
+    const trimmed = raw.trim()
+    if (trimmed === '') return false
+    try {
+      JSON.parse(trimmed)
+      return false
+    } catch {
+      return true
+    }
+  }
+
+  /** 丢弃 arguments 残缺的 tool_call（返回新数组；正例零改动）。 */
+  function dropTruncatedToolCalls(calls: Record<string, unknown>[]): Record<string, unknown>[] {
+    return calls.filter((call) => {
+      const fn = call.function
+      if (!fn || typeof fn !== 'object') return true
+      const args = (fn as Record<string, unknown>).arguments
+      if (typeof args !== 'string') return true
+      return !isTruncatedArguments(args)
+    })
+  }
+
+  /**
+   * 非流式 usage 缺 `total_tokens` 时合成补齐（移植 workbuddy2api 213e362，对齐源
+   * `ensureUsageTotal`）。OpenAI 非流式 usage 必含 total_tokens；部分上游末帧只发
+   * prompt_tokens + completion_tokens。已有 total 不覆盖；缺单边不臆造（单边有值
+   * 无法合成可信 total）；合成走新对象，不改上游 map（不可变口径）。
+   */
+  function ensureUsageTotal(u: Record<string, unknown>): Record<string, unknown> {
+    if (u.total_tokens !== undefined) return u
+    const pt = u.prompt_tokens
+    const ct = u.completion_tokens
+    if (typeof pt !== 'number' || typeof ct !== 'number') return u
+    if (!Number.isFinite(pt) || !Number.isFinite(ct)) return u
+    return { ...u, total_tokens: pt + ct }
+  }
+
+  /** 消费一行 SSE 负载；返回 false 表示已确认上游错误，可提前停止聚合。 */
+  function consume(data: string): boolean {
+    try {
+      const chunk = JSON.parse(data)
+      // 有效事件计数：解析成功即为一次有效数据帧（错误帧同样计数——它也是客户端
+      // 可见的数据事件，且下面会终止聚合走错误返回）。计数在错误帧判定**之前**，
+      // 与源实现 writeFrame / Aggregate 的计数位置一致。
+      if (chunk && typeof chunk === 'object' && !Array.isArray(chunk)) validEvents++
+      // 上游错误帧：记录并终止（后续帧不再有意义）
+      if (chunk && typeof chunk === 'object' && chunk.error !== undefined && chunk.error !== null) {
+        streamError = sanitizeWorkbuddyErrorFrame(chunk as Record<string, unknown>, sanitizeError)
+        return false
+      }
+      if (chunk.id) respID = chunk.id
+      if (chunk.model) respModel = chunk.model
+      if (chunk.created) created = chunk.created
+      if (chunk.usage) usage = chunk.usage
+
+      const choices = chunk.choices as any[]
+      if (Array.isArray(choices)) {
+        for (const choice of choices) {
+          const delta = choice?.delta
+          if (delta && typeof delta === 'object') {
+            if (delta.role) role = delta.role
+            // 空串 content 不占 latch（移植 94bc325 + f2e51ab）：role-only 首帧
+            // （`delta.content=""`）此前会占住 gotAnyContent，使后续整条 message 兜底帧
+            // 被拒 → 200 + 空正文。此处与 mergeMessageFields 共用 appendContent。
+            if (typeof delta.content === 'string') appendContent(delta.content)
+            if (typeof delta.reasoning_content === 'string') reasoning += delta.reasoning_content
+            if (Array.isArray(delta.tool_calls)) {
+              // 缺 index 的分派见 mergeToolCallsChunk（移植 5c2db2f）
+              mergeToolCallsChunk(delta.tool_calls)
+            }
+          }
+          // 非 delta 的完整 message 兜底（移植 11b75d4 + 6701631）：与 delta 分支同构
+          // 合并 role/content/reasoning_content/tool_calls，并由 gotAnyContent 守卫
+          // 防止「每帧都带完整 message」的上游把正文重复 N 遍。
+          const msg = choice?.message
+          if (msg && typeof msg === 'object' && !Array.isArray(msg) && !gotAnyContent) {
+            mergeMessageFields(msg as Record<string, unknown>)
+          }
+          if (choice.finish_reason) finish = choice.finish_reason
+        }
+      }
+    } catch {
+      // 跳过无法解析的行
+    }
+    return true
+  }
+
+  let buffer = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    // 按行处理
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || '' // 保留未完成的行
+    for (const line of lines) {
+      let data = line.trim()
+      if (!data) continue
+      if (data.startsWith('data:')) data = data.slice(5).trim()
+      if (!data) continue
+      if (data === '[DONE]') {
+        // 上游显式正常收尾（移植 65b2f33：EOF 截断判定依赖本标志）
+        sawDone = true
+        continue
+      }
+      if (!consume(data)) break
+    }
+    if (streamError) break
+  }
+  // 处理 buffer 中剩余的行
+  if (!streamError && buffer.trim()) {
+    let data = buffer.trim()
+    if (data.startsWith('data:')) data = data.slice(5).trim()
+    if (data === '[DONE]') sawDone = true
+    else if (data) consume(data)
+  }
+
+  // 上游流内报错 → 交调用方按错误返回，绝不产出 200 + 空内容
+  if (streamError) return { ok: false, error: streamError }
+
+  // 空流哨兵（移植 workbuddy2api 0a86854）：上游 200 但**没有任何有效数据事件**
+  // （空体 / 只有 [DONE] / 只有注释行）。此前会合成 content:"" 的假成功 200——
+  // 客户端既拿不到内容也拿不到错误（最坏的失败形态），运维日志里也看不到失败。
+  // 现在直接报错，由调用方映射为 502 + code=upstream_parse（workbuddyStreamErrorResponse
+  // 非 6004 一律 502，与源实现 handler 的 502 upstream_parse 同语义）。
+  if (validEvents === 0) {
+    return {
+      ok: false,
+      error: { message: 'empty upstream stream', code: 'upstream_parse', raw: WORKBUDDY_EMPTY_STREAM_FRAME },
+    }
+  }
+
+  const message: Record<string, unknown> = {
+    role: role || 'assistant',
+    content: content,
+  }
+  if (reasoning) message.reasoning_content = reasoning
+  if (toolOrder.length > 0) {
+    toolOrder.sort((a, b) => a - b)
+    let calls = toolOrder.map(idx => toolCalls.get(idx)!)
+    // 截断来源判定（移植 65b2f33，对齐源 Aggregate）：model 因 max_tokens 提前中止
+    // （finish_reason=length），或上游连接中断（EOF 收尾但未发 data: [DONE]）时，
+    // tool_call 的 arguments 可能只剩半截 JSON——残缺参数交给客户端会被解析成非法
+    // JSON 卡死会话。完整参数原样保留（正例零改动）；空参数（无参工具）不是截断。
+    if (finish === 'length' || !sawDone) {
+      calls = dropTruncatedToolCalls(calls)
+    }
+    if (calls.length > 0) message.tool_calls = calls
+  }
+
+  const result: Record<string, unknown> = {
+    id: respID || 'chatcmpl-workbuddy',
+    object: 'chat.completion',
+    created: created || Math.floor(Date.now() / 1000),
+    model: respModel || model || 'unknown',
+    choices: [{
+      index: 0,
+      message: message,
+      finish_reason: finish || 'stop',
+    }],
+  }
+  if (usage) result.usage = ensureUsageTotal(usage)
+
+  return { ok: true, body: JSON.stringify(result) }
+}
+
+/**
+ * 把聚合到的上游错误帧转成对客户端的 HTTP 错误响应（非流式路径）。
+ *
+ * 口径（折中方案）：**语义透传 + 网关脱敏**——错误码/文案/requestId 都交给客户端
+ * （上游 commit 5755fe3 的 error-passthrough 意图），但文本已经过 `sanitizeUpstreamError`
+ * 脱敏（长度截断、控制字符剥离、内网地址与凭据脱敏），不违背本仓脱敏红线。
+ *
+ * 状态码按错误类别映射：模型级限流 6004 → 429（客户端应等待重试），其余 → 502
+ * （上游在流中报错，属上游侧失败）。
+ *
+ * gateway_hint（移植 workbuddy2api fa7b5d9 `writeOpenAIErrorHint`）：错误帧已按上游真实
+ * code/文案判定出 `error.hint` 时**并列**附加 `error.gateway_hint`——message/code/request_id
+ * 一字不改；hint 未定义（未覆盖形态）→ 字段**缺席**（不编造）。
+ */
+function workbuddyStreamErrorResponse(error: WorkbuddyErrorFrame): Response {
+  const codeText = error.code !== undefined && error.code !== null ? String(error.code) : ''
+  const status = codeText === '6004' ? 429 : 502
+  const errorObj: Record<string, unknown> = {
+    message: error.message || '上游在流式响应中返回错误',
+    type: codeText === '6004' ? 'rate_limit_exceeded' : 'upstream_error',
+  }
+  if (error.code !== undefined) errorObj.code = error.code
+  if (error.requestId !== undefined) errorObj.request_id = error.requestId
+  if (error.hint) errorObj.gateway_hint = error.hint
+  return new Response(JSON.stringify({ error: errorObj }), {
+    status,
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+  })
+}
+
+/**
+ * WorkBuddy SSE chunk 清洗（**纯函数版，无跨帧状态**）。
+ *
+ * @deprecated 池化与非池化 OAuth 路径已改用 `createWorkbuddyChunkCleaner()`（workbuddy-sse.ts）
+ * ——后者额外提供白名单重建、首帧 id 续传、tool_calls name 跨帧回填（移植 workbuddy2api sse.go），
+ * 这些能力必须有跨帧状态，纯函数无法表达。本函数保留仅供其他调用方/回归对比使用。
+ */
+function cleanWorkbuddyChunk(chunk: string): string {
+  // 只处理 SSE data: 行
+  let data = chunk.trim()
+  if (!data) return chunk
+
+  const hasPrefix = data.startsWith('data:')
+  if (hasPrefix) {
+    data = data.slice(5).trim()
+  }
+  if (!data || data === '[DONE]') return chunk
+
+  try {
+    const obj = JSON.parse(data)
+    let changed = false
+    const choices = obj?.choices as any[]
+    if (Array.isArray(choices)) {
+      for (const choice of choices) {
+        const delta = choice?.delta
+        if (!delta || typeof delta !== 'object') continue
+
+        // 去掉空的/全空值的 function_call（WorkBuddy 终端 chunk 常有
+        // function_call: {"name":"","arguments":""}，2 个 key 但全是空值）
+        if (delta.function_call !== undefined) {
+          if (delta.function_call === null) {
+            delete delta.function_call
+            changed = true
+          } else if (typeof delta.function_call === 'object') {
+            const vals = Object.values(delta.function_call)
+            if (vals.length === 0 || vals.every((v: any) => v === null || v === '')) {
+              delete delta.function_call
+              changed = true
+            }
+          }
+        }
+
+        // 去掉空的 tool_calls 数组（WorkBuddy 终端 chunk 的标志性问题）
+        if (Array.isArray(delta.tool_calls) && delta.tool_calls.length === 0) {
+          delete delta.tool_calls
+          changed = true
+        }
+        // 去掉空的噪音字段
+        for (const noise of ['extra_fields', 'refusal', 'reasoning_content']) {
+          if (delta[noise] === null || delta[noise] === '' || delta[noise] === undefined) {
+            delete delta[noise]
+            changed = true
+          }
+        }
+        // 如果 delta 完全为空且没有 finish_reason，整个 chunk 丢弃
+        if (Object.keys(delta).length === 0 && !choice.finish_reason) {
+          return ''
+        }
+      }
+    }
+    if (!changed) return chunk
+    const cleaned = JSON.stringify(obj)
+    return hasPrefix ? `data: ${cleaned}` : cleaned
+  } catch {
+    // 非 JSON 行原样返回
+    return chunk
+  }
+}
+
+/**
+ * 透传上游响应，保留 Content-Type（含 SSE text/event-stream）等关键头。
+ * 修复 SSE 流式响应被截断/解码失败的问题：
+ * - 不硬编码 application/json 作为 fallback（SSE 流的 Content-Type 是 text/event-stream）
+ * - 添加 X-Accel-Buffering: no 防止中间代理缓冲 SSE 流
+ * - 保留上游的 Transfer-Encoding 相关行为（Workers 自动处理 chunked）
+ *
+ * P2-4：带 cleanFn 的路径（WorkBuddy 池化 / WorkBuddy 非池化 SSE 重建）会在输出流外层套
+ * withSSEKeepAlive 空闲兜底（SSE_IDLE_TIMEOUT_MS = 180s）——上游超过该时长完全无数据时主动结束流，
+ * 防止长思考/挂死流无限占用。不注入心跳（keepAliveMs=0）：避免 `: keep-alive` 注释行被 cleanFn
+ * 误处理后破坏 SSE 帧结构。
+ */
+function passthroughResponse(
+  response: Response,
+  cleanFn?: (chunk: string) => string,
+  onLine?: (line: string) => void,
+  stopSignal?: { aborted: boolean },
+  /**
+   * 流收尾钩子（移植 workbuddy2api 0a86854 的空流兜底挂载点）：上游流出结束（正常读完
+   * 或被护盾中止）后调用一次，返回需补写到客户端的尾部文本（'' / undefined = 不补写）。
+   * 只有需要「流级收尾决定」的调用方传它——WorkBuddy 用它在 0 有效帧时补 error 帧 + [DONE]，
+   * 否则上游「200 + 空流」会被客户端当成正常收尾。
+   */
+  onEnd?: () => string | void
+): Response {
+  const headers: Record<string, string> = {
+    'Cache-Control': 'no-store',
+    'X-Accel-Buffering': 'no',
+  }
+  const ct = response.headers.get('Content-Type')
+  if (ct) headers['Content-Type'] = ct
+  // R9：3xx 重定向响应补透传 Location，否则客户端（curl/客户端 SDK）重定向链断裂。
+  // 其他头（Cookie、Set-Cookie 等）不与透传——避免把敏感控制面头泄漏给模型客户端。
+  if (response.status >= 300 && response.status < 400) {
+    const loc = response.headers.get('Location')
+    if (loc) headers['Location'] = loc
+  }
+
+  // 无清洗函数或 body 不存在，直接透传
+  if (!cleanFn || !response.body) {
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    })
+  }
+
+  // 通过 TransformStream 对 SSE 文本流做逐行清洗
+  const { readable, writable } = new TransformStream<string, Uint8Array>({
+    transform(chunk, controller) {
+      const encoder = new TextEncoder()
+      // 空行是 SSE 事件分隔符（\n\n 中的第二个 \n），必须原样保留，
+      // 否则严格 SSE 解析器（如 Trae/OpenCode）会把所有 data: 行合并成
+      // 一个事件，JSON 解析失败导致内容被整体丢弃。
+      if (chunk === '') {
+        controller.enqueue(encoder.encode('\n'))
+        return
+      }
+      const cleaned = cleanFn(chunk)
+      if (cleaned) {
+        controller.enqueue(encoder.encode(cleaned + '\n'))
+      }
+    },
+  })
+
+  // 使用 pipeTo 将上游 body 通过 TextDecoderStream 管道化到清洗流。
+  // 关键：TextDecoderStream 按底层缓冲区切分 chunk，可能在任何位置切断。
+  // 必须维护行缓冲区，将不完整的行与下一个 chunk 拼接，否则 SSE data: 行
+  // 的 JSON 可能被换行符截断（如 data: {"id":"xxx-\n yyy"...}），导致
+  // 客户端 SSE 解析器（如 OpenMinis 的 ssePayload）收到不以 "data:" 开头
+  // 的行而丢弃，最终造成内容不完整。
+  const writer = writable.getWriter()
+  const decoder = new TextDecoderStream()
+  const reader = response.body.pipeThrough(decoder).getReader()
+  ;(async () => {
+    let lineBuffer = ''
+    try {
+      while (true) {
+        if (stopSignal?.aborted) {
+          try { await reader.cancel() } catch { /* ignore */ }
+          break
+        }
+        const { done, value } = await reader.read()
+        if (done) break
+        // 将缓冲区与当前 chunk 拼接
+        const combined = lineBuffer + value
+        const lines = combined.split('\n')
+        // 最后一行可能不完整，保留到缓冲区
+        lineBuffer = lines.pop() || ''
+        for (const line of lines) {
+          if (stopSignal?.aborted) {
+            try { await reader.cancel() } catch { /* ignore */ }
+            break
+          }
+          try { onLine?.(line) } catch { /* ignore */ }
+          // 空行也要传递（SSE 事件分隔符），不能过滤
+          await writer.write(line)
+        }
+        if (stopSignal?.aborted) break
+      }
+      // 流结束后，处理缓冲区中剩余的最后一行（若未中止）
+      if (!stopSignal?.aborted && lineBuffer.trim()) {
+        try { onLine?.(lineBuffer) } catch { /* ignore */ }
+        await writer.write(lineBuffer)
+      }
+    } catch { /* 流异常，忽略 */ }
+    // 流收尾：补写尾部帧（如 WorkBuddy 空流兜底的 error 帧 + [DONE]）。
+    // 放在 close 之前，且异常隔离——收尾失败绝不能影响已发出的流。
+    try {
+      const tail = onEnd?.()
+      if (tail) await writer.write(tail)
+    } catch { /* 收尾异常忽略 */ }
+    try { await writer.close() } catch { /* already closed */ }
+  })()
+
+  // P2-4 空闲监控断流：SSE（重建/清洗）路径包 idle 兜底。
+  // 上游（长思考/挂死）超过 SSE_IDLE_TIMEOUT_MS 无任何数据时主动结束流，防止无限挂起占资源。
+  // 与其它 SSE 路径（withSSEKeepAlive）共用同一 idle 阈值，保持行为一致。
+  // 心跳不在此注入（keepAliveMs=0）：避免 `: keep-alive` 注释行被上方 cleanFn 误处理后破坏
+  // SSE 帧结构——该路径核心是「上游空闲断流」而非「客户端防断流」（后者由更外层承担）。
+  const guardedBody = withSSEKeepAlive(readable, 0, SSE_IDLE_TIMEOUT_MS)
+  return new Response(guardedBody, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  })
+}
+
+/**
+ * WorkBuddy 流式**空流兜底**钩子工厂（移植 workbuddy2api 0a86854 的 StreamHint 收尾段）。
+ *
+ * 背景：上游 200 但一帧有效数据都没有（空体 / 只有 [DONE] / 只有注释行）时，网关此前
+ * 原样结束流——客户端既拿不到内容也拿不到错误，还会把它当正常收尾（假成功），
+ * 运维在日志里也只看到 200。源实现的做法是：HTTP 头已发出只能 200，但流结束前补一帧
+ * `error`（code=upstream_parse）+ `[DONE]`，并记一条 WARN/502 观测。
+ *
+ * 何时**不**套用（返回 undefined，退回既有行为）：
+ *  - `apply` 为假：客户端没要流式（非流式走聚合路径，那里空流已映射 502）、上游非 2xx、
+ *    或 Content-Type 不是 SSE——后两种下响应体多为 JSON，补 SSE 帧会污染它；
+ *  - 清洗器已发合成终态帧（护盾熔断自带 [DONE]）时 finishStream 自行返回 ''，不会重复补。
+ */
+function workbuddyEmptyStreamGuard(
+  cleaner: WorkbuddyChunkCleaner,
+  apply: boolean,
+  providerId: string,
+  model: string
+): (() => string) | undefined {
+  if (!apply) return undefined
+  return () => {
+    const stats = cleaner.frameStats()
+    if (stats.validFrames === 0 && !stats.terminated) {
+      console.warn(`[proxy-oauth] WorkBuddy 空流兜底：上游 200 但 0 有效帧，已补 error 帧(code=upstream_parse)+[DONE] provider=${providerId} model=${model}`)
+    } else if (stats.doneWithheld) {
+      console.warn(`[proxy-oauth] WorkBuddy 畸形流：有效帧出现在 [DONE] 之后，已补收尾 [DONE] provider=${providerId} model=${model}`)
+    }
+    return cleaner.finishStream()
+  }
+}
+
+/**
+ * 判断某上游响应是否该套用 WorkBuddy 流式空流兜底：仅「客户端要流式 + 上游 2xx +
+ * Content-Type 是 SSE」三种条件同时成立时才套用（理由见 workbuddyEmptyStreamGuard）。
+ */
+function shouldGuardWorkbuddyEmptyStream(response: Response, originalStream: unknown): boolean {
+  if (originalStream !== true || !response.ok) return false
+  return (response.headers.get('Content-Type') || '').toLowerCase().includes('text/event-stream')
+}
+
+const isStreamRequest = (body: ProxyRequestBody): boolean => body.stream === true
+const getRoute = (url: URL): string => url.pathname.replace(/^\/v1\//, '') || 'chat/completions'
+
+/** WorkBuddy 多账号池单请求最多换号次数（对齐 trae MAX_ROTATE / Go 默认 3）。 */
+const MAX_OAUTH_ROTATE = 3
+
+// P7：上游请求头白名单透传（从 aihub 移植）。
+// 客户端发来的一层自定义头（如 OpenRouter 的 X-Title / HTTP-Referer、x-api-key 认证、
+// Anthropic 的 anthropic-version / anthropic-beta、企业网关 user- 身份头）默认被丢弃，
+// 这里按前缀白名单透传给上游。仅过滤前缀，无需关心值内容。
+const PASSTHROUGH_HEADER_PREFIXES = ['x-', 'anthropic-', 'user-', 'referer', 'http-referer']
+
+/**
+ * 从客户端请求中收集白名单前缀头（小写匹配，保留原始大小写），供转发上游时附加。
+ * 独立于具体转发路径：通用转发 / OAuth 转发等均可复用。
+ */
+export function buildPassthroughHeaders(c: Context<AppEnv>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [key, value] of c.req.raw.headers.entries()) {
+    const lower = key.toLowerCase()
+    if (PASSTHROUGH_HEADER_PREFIXES.some((p) => lower.startsWith(p)) && value) {
+      out[key] = value
+    }
+  }
+  return out
+}
+
+/**
+ * P2：上游 fetch——取消「5 分钟整体超时」对流式 body 的持续生效（长思考/agent 中途被掐断）。
+ * - 非流式：保持整体超时（totalTimeoutMs，默认 5 分钟）行为。
+ * - 流式：连接/首字节超时（connectTimeoutMs，默认 90s），拿到 response 后 clearTimeout；
+ *   SSE body 额外包 withSSEKeepAlive（idle 兜底 + 心跳，默认 240s / 15s）。
+ * 以上阈值均来自「性能设置」（KV 可编辑，见 src/perf.ts），后台可调。
+ */
+function fetchUpstream(
+  env: Env,
+  url: string,
+  init: RequestInit,
+  isStream: boolean,
+): Promise<Response> {
+  return getPerfSettings(env).then((perf) => {
+    if (!isStream) {
+      return fetch(url, { ...init, signal: AbortSignal.timeout(perf.totalTimeoutMs) })
+    }
+    return streamFetchWithTimeout(url, init, {
+      connectTimeoutMs: perf.connectTimeoutMs,
+      idleTimeoutMs: perf.idleTimeoutMs,
+      keepAliveMs: perf.keepAliveMs,
+    })
+  })
+}
+
+// ===== 瞬时错误自动重试 =====
+// Trae 等客户端直连网关时，上游偶发瞬时 5xx/网络抖动会直接透传失败，
+// 客户端在读取响应流时再叠加 TLS/网络抖动（如 SEC_E_MESSAGE_ALTERED）就报错。
+// 既然"重试一次又正常"，网关侧对瞬时错误自动重试 1 次即可消除大部分此类问题。
+// 注意：500 也纳入——上游过载/限流网关常见偶发 500，重试与 502/503/504 一视同仁。
+const TRANSIENT_RETRY_MAX = 1
+const TRANSIENT_RETRY_DELAY_MS = 400
+/** 瞬时性上游状态码：可安全对同一请求重试（区别于 4xx 的确定性错误） */
+function isTransientStatus(status: number): boolean {
+  return status === 500 || status === 502 || status === 503 || status === 504
+}
+
+/**
+ * OAuth 账号路径的瞬时重试上限（**刻意高于**通用路径的 `TRANSIENT_RETRY_MAX = 1`）。
+ *
+ * 为什么不复用同一个常量：两条路径重试失败的代价不对称。
+ *  - 通用（apiKey）路径：重试耗尽只是把错误透传给客户端，客户端自己会重试；
+ *  - OAuth 池路径：重试耗尽会**冷却一个健康账号**（下方 WAF 403 分支
+ *    `cooldownOauthAccount` + 粘性解绑），而国际版池常常只有 1–2 个号 ——
+ *    `MAX_OAUTH_ROTATE = 3` 但池里没号可换，两个号各中一次就是整池不可用
+ *    （`no healthy account (cooling/disabled)`）。
+ * 所以这里用更宽的预算换「不罚号」：多发一两个子请求，远便宜于冷掉一个号。
+ */
+const OAUTH_TRANSIENT_RETRY_MAX = 2
+
+/**
+ * 该响应是否值得对**同一账号**原地重发（瞬时失败）。
+ *
+ * 判据：
+ *  - 5xx（`isTransientStatus`）；
+ *  - **403 且响应体无业务信封**（`isWafBlocked`）—— APISIX / Cloudflare 边缘拦截页形态。
+ *    这类 403 在 OAuth 路径上会走 WAF 分支：软冷却账号 + 粘性解绑 + 换号。但拦截页
+ *    反映的是**边缘节点/出口 IP** 的瞬时风控，账号本身健康（见 WAF 分支注释），
+ *    原地重发有很大概率落到另一个边缘节点即成功。先重试、再罚号，恢复成本差一个数量级。
+ *
+ * 只在 403 时读 body 副本：5xx 直接返回 true，避免对正常（流式）响应做多余的 clone/tee。
+ * 副本读取失败（流不可克隆等）按「不重试」保守处理，保持既有行为不变。
+ */
+async function isRetryableUpstreamResponse(res: Response): Promise<boolean> {
+  if (isTransientStatus(res.status)) return true
+  if (res.status !== 403) return false
+  try {
+    return isWafBlocked(res.status, await res.clone().text())
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Anthropic 原生上游转发（provider.apiType === 'anthropic'，如 api.anthropic.com）。
+ * 请求体 / 认证 / 路径都走 Anthropic 原生格式：
+ * - URL：{base}/v1/messages（自动去掉 baseUrl 末尾的 /v1）
+ * - 认证：x-api-key + anthropic-version: 2023-06-01（+ 浏览器直连标记）
+ * - 请求体：内部 OpenAI 规范格式经 openAIRequestToAnthropic 转回 Anthropic
+ * 响应按客户端 route 处理：
+ * - 'messages'：Anthropic → Anthropic，直接透传（保真度最高，thinking/tool_use 原样保留）
+ * - 'chat'    ：Anthropic → OpenAI chat.completion（非流式 / 流式）
+ * - 'responses'：Anthropic → OpenAI Responses（非流式 / 流式）
+ * 多 Key 顺序 failover，与 messages / responses 通用兜底路径一致。
+ */
+async function proxyAnthropicNativeUpstream(
+  c: Context<AppEnv>,
+  provider: import('./types').Provider,
+  providerId: string,
+  model: string,
+  openaiBody: Record<string, unknown>,
+  originalStream: boolean,
+  route: 'messages' | 'chat' | 'responses',
+  g5Base?: unknown[],
+  g5Save?: (respId: string, fullHistory: unknown[]) => void
+): Promise<Response> {
+  const enabledKeys = provider.apiKeys.filter((k) => k.enabled)
+  if (enabledKeys.length === 0) {
+    return c.json({
+      error: { type: 'configuration_error', message: `提供商 "${provider.name}" 未配置可用的 API Key` },
+    }, 500)
+  }
+
+  const resolvedBase = resolveProviderBaseUrl(c.env, provider.baseUrl)
+  if (!resolvedBase) {
+    return c.json({
+      error: { type: 'configuration_error', message: `提供商 "${provider.name}" 的 baseUrl 含 {CF_ACCOUNT_ID} 占位符，但环境变量 CF_ACCOUNT_ID 未配置` },
+    }, 500)
+  }
+  // 归一 baseUrl：去掉末尾斜杠与 /v1，统一拼 v1/messages
+  //（兼容 https://api.anthropic.com 与 https://api.anthropic.com/v1 两种写法）
+  let cleanBase = resolvedBase.replace(/\/+$/, '')
+  cleanBase = cleanBase.replace(/\/v1\/?$/, '')
+  const forwardUrl = `${cleanBase}/v1/messages`
+
+  // 思考预算钳制：部分 Anthropic 兼容端点（商汤日日新 senseNova）对 thinking.budget_tokens
+  // 有严格上限（实测 ≤1024），超限会被拒绝（Thinking.BudgetTokens invalid）。识别到该提供商时
+  // 在 OpenAI→Anthropic 出口把 reasoning_effort 换算出的预算钳到允许范围，保证工具调用链路可用。
+  const isSensenova = String(provider.id).toLowerCase() === 'sensenova' || (provider.baseUrl || '').toLowerCase().includes('sensenova')
+  const upstreamBody = openAIRequestToAnthropic(openaiBody, isSensenova ? { maxThinkingBudgetTokens: 1024 } : undefined)
+
+  // R3 风格多 Key 顺序 failover：单 key 故障（HTTP 非 2xx 或网络异常）自动切换下一个
+  let response: Response | undefined
+  let lastErrText = ''
+  let lastStatus = 502
+  for (const key of enabledKeys) {
+    try {
+      const r = await fetchUpstream(c.env, forwardUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          // 同时携带两种认证头以兼容不同上游：
+          // - 官方 api.anthropic.com 认 x-api-key；
+          // - SenseNova 等第三方 Anthropic 兼容端点（https://platform.sensenova.cn/docs）
+          //   要求 Authorization: Bearer <key>，忽略 x-api-key，否则返回 code 16
+          //   "Authorization Not Found"。两个头都带，两端互不冲突。
+          'x-api-key': key.key,
+          'Authorization': `Bearer ${key.key}`,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+          ...buildPassthroughHeaders(c),
+        },
+        body: JSON.stringify(upstreamBody),
+      }, originalStream === true)
+      if (r.ok) { response = r; break }
+      lastStatus = r.status
+      lastErrText = await r.text().catch(() => '')
+    } catch (err) {
+      lastStatus = 502
+      lastErrText = (err as Error).message || '网络错误'
+    }
+  }
+
+  if (!response) {
+    try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic-native] ${model} → failover 全部失败 ${forwardUrl}`, JSON.stringify({ error: lastErrText, body: summarizeRequestBody(openaiBody), url: forwardUrl }).substring(0, 4000))) } catch {}
+    return c.json({
+      error: { type: 'upstream_error', message: `Upstream error: ${sanitizeUpstreamError(lastErrText)}` },
+    }, lastStatus as Parameters<typeof c.json>[1])
+  }
+
+  try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[anthropic-native] ${model} → 200 ${forwardUrl}`, `route=${route} stream=${originalStream}`)) } catch {}
+
+  // ---- route: messages —— Anthropic → Anthropic，直接透传（最大保真） ----
+  if (route === 'messages') {
+    if (originalStream && response.body) {
+      return new Response(withSSEKeepAlive(response.body, SSE_KEEPALIVE_MS, SSE_IDLE_TIMEOUT_MS), {
+        status: response.status,
+        statusText: response.statusText,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-store',
+          'X-Accel-Buffering': 'no',
+        },
+      })
+    }
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers: response.headers })
+  }
+
+  // ---- route: chat / responses —— Anthropic → OpenAI 反向转换 ----
+
+  // 流式：Anthropic SSE → OpenAI SSE / Responses SSE 实时转换
+  if (originalStream && response.body) {
+    const so = openaiBody['stream_options'] as Record<string, unknown> | undefined
+    const includeUsage = route === 'chat' ? (so === undefined ? true : so['include_usage'] === true) : true
+    const conv = route === 'chat' ? createAnthropicSSEToOpenAI(model, { includeUsage }) : createAnthropicSSEToResponses(model, {
+      onCompleted: g5Save && g5Base ? (info) => {
+        try { g5Save(info.responseId, [...g5Base, buildG5AssistantMessage(info.textContent, info.toolCalls)]) } catch {}
+      } : undefined,
+    })
+    const readable = new ReadableStream({
+      async start(controller) {
+        const decoder = new TextDecoderStream()
+        const textReader = response.body!.pipeThrough(decoder).getReader()
+        let lineBuffer = ''
+        let currentEvent = ''
+        try {
+          while (true) {
+            const { done, value } = await textReader.read()
+            if (done) break
+            lineBuffer += value
+            let nl: number
+            while ((nl = lineBuffer.indexOf('\n')) >= 0) {
+              const line = lineBuffer.slice(0, nl)
+              lineBuffer = lineBuffer.slice(nl + 1)
+              const trimmed = line.trim()
+              if (!trimmed) continue
+              if (trimmed.startsWith('event:')) {
+                currentEvent = trimmed.slice(6).trim()
+              } else if (trimmed.startsWith('data:')) {
+                const data = trimmed.slice(5).trim()
+                if (!data) continue
+                let parsed: Record<string, unknown>
+                try { parsed = JSON.parse(data) as Record<string, unknown> } catch { continue }
+                for (const s of conv(currentEvent, parsed)) {
+                  controller.enqueue(new TextEncoder().encode(s))
+                }
+              }
+            }
+          }
+        } catch { /* stream error */ }
+        controller.close()
+      },
+    })
+    return new Response(readable, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-store',
+        'X-Accel-Buffering': 'no',
+      },
+    })
+  }
+
+  // 非流式：Anthropic JSON → OpenAI / Responses
+  const payload = await response.json().catch(() => null) as Record<string, unknown> | null
+  const converted = route === 'chat'
+    ? anthropicResponseToOpenAI(payload || {}, model)
+    : anthropicResponseToResponses(payload || {}, model)
+  // G5: 非流式 responses 路径保存多轮历史
+  if (route === 'responses' && g5Base && g5Save) {
+    try {
+      const r = converted as Record<string, unknown>
+      g5Save(String(r['id'] ?? ''), [
+        ...g5Base,
+        responsesOutputToAssistantMessage(r['output'] as Array<Record<string, unknown>> | undefined),
+      ])
+    } catch { /* 保存失败不影响响应 */ }
+  }
+  return c.json(converted)
+}
+
+const normalizeUsage = (route: string, provider: import('./types').Provider, payload: unknown): UsageMetrics | null => {
+  if (route === 'responses') return normalizeResponsesUsage(payload)
+  if (route === 'messages' || provider.apiType === 'anthropic') return normalizeAnthropicUsage(payload)
+  return normalizeChatUsage(payload)
+}
+
+const readErrorResponse = async (response: Response): Promise<{ payload: unknown; summary: string }> => {
+  const text = await response.text().catch(() => '')
+  try {
+    const payload: unknown = JSON.parse(text)
+    return { payload, summary: summarizeError(payload) }
+  } catch {
+    return { payload: { error: { message: text || `HTTP ${response.status}` } }, summary: summarizeError(text || `HTTP ${response.status}`) }
+  }
+}
+
+const finalizeProxyResponse = async (
+  c: Context<AppEnv>,
+  response: Response,
+  context: AnalyticsContext,
+  route: string,
+  probeProviderType = '',
+): Promise<Response> => {
+  const headers = new Headers(response.headers)
+  headers.set('Cache-Control', 'no-store')
+  // 结果按上游状态判定：4xx/5xx 记为 failure（此前一律写 success，导致管理端
+  // 失败率恒为 0，而 result 维度与 failures 指标都基于这个字段）。
+  const result: 'success' | 'failure' = response.ok ? 'success' : 'failure'
+  if (!response.body) {
+    writeAnalyticsEvent(c, { context, result, upstreamStatus: response.status })
+    return new Response(null, { status: response.status, statusText: response.statusText, headers })
+  }
+
+  if (context.streamMode === 'stream') {
+    // R2：单消费链——usage 探针内联进透传管道（pipeThrough）。
+    // 不再 tee 出独立观察支流：旧实现里客户端断开后观察支流仍会继续读完上游
+    // body；现在客户端 Cancel 会沿管道传播到上游，立即停止后续流消费。
+    let usage: UsageMetrics | undefined
+    const probe = createStreamUsageProbe(probeProviderType, (value) => {
+      usage = usage ? {
+        promptTokens: Math.max(usage.promptTokens, value.promptTokens),
+        completionTokens: Math.max(usage.completionTokens, value.completionTokens),
+        cachedTokens: Math.max(usage.cachedTokens, value.cachedTokens),
+        totalTokens: Math.max(usage.totalTokens, value.totalTokens),
+      } : value
+    }, () => {
+      // 正常流结束时写 analytics；客户端中途断开（cancel）不会走到这里
+      writeAnalyticsEvent(c, { context, result, usage, upstreamStatus: response.status })
+    })
+    const clientStream = response.body.pipeThrough(probe)
+    return new Response(clientStream, { status: response.status, statusText: response.statusText, headers })
+  }
+
+  // 非流式：不 tee（P3，避免响应体双份缓冲），先整体读一次解析 usage，再用同一份 payload 构造响应
+  const contentType = headers.get('Content-Type') || ''
+  if (contentType.includes('json')) {
+    const payload = await response.json().catch(() => null) as unknown
+    const usage = normalizeUsage(route, { apiType: 'openai' } as import('./types').Provider, payload) || undefined
+    writeAnalyticsEvent(c, { context, result, usage, upstreamStatus: response.status })
+    headers.delete('Content-Length')  // 重序列化后长度可能变化，去掉上游旧值
+    return new Response(JSON.stringify(payload), { status: response.status, statusText: response.statusText, headers })
+  }
+  writeAnalyticsEvent(c, { context, result, upstreamStatus: response.status })
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
+}
+
+/** 测试模型连接，发送最小请求验证 */
+export async function testModelConnection(
+  baseUrl: string,
+  apiKey: string,
+  modelId: string,
+  apiType?: 'openai' | 'anthropic'
+): Promise<{ success: boolean; message: string; statusCode?: number }> {
+  try {
+    const cleanBase = baseUrl.replace(/\/$/, '')
+    // aigateway 内部始终用 OpenAI chat/completions 格式与上游通信，
+    // apiType 只影响客户端侧暴露的 API 格式（Anthropic/Responses 等）。
+    const url = `${cleanBase}/chat/completions`
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    }
+    // 始终用 Bearer Authorization 发 OpenAI 格式请求到上游
+    headers['Authorization'] = `Bearer ${apiKey}`
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: modelId,
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 1,
+      }),
+      signal: AbortSignal.timeout(15000),
+    })
+
+    if (response.ok) {
+      return { success: true, message: '连接成功', statusCode: response.status }
+    }
+
+    let errorBody = ''
+    // body 只能读一次：先取全文，再按 JSON 解析（json() 失败后 catch 里再 text()
+    // 会抛 "Body has already been used. Use tee() first"——同一 body 被消费两次）
+    const rawText = await response.text().catch(() => '')
+    try {
+      const errorData = JSON.parse(rawText) as { error?: { message?: string } }
+      errorBody = errorData?.error?.message || JSON.stringify(errorData)
+    } catch {
+      errorBody = rawText
+    }
+
+    return {
+      success: false,
+      message: `HTTP ${response.status}: ${errorBody.substring(0, 200)}`,
+      statusCode: response.status,
+    }
+  } catch (err) {
+    const error = err as Error
+    return {
+      success: false,
+      message: `连接失败: ${error.message?.substring(0, 200) || '未知错误'}`,
+    }
+  }
+}
+
+/**
+ * 有界读取入站 JSON 请求体（移植 M365-Gateway request-body.ts）。
+ * 与直接 `c.req.json()` 的差异：在读流过程中累计字节数，超限即取消并抛 RequestBodyError，
+ * 保证 Worker 隔离区不会先缓冲一个超大请求体再解析（对齐 128MiB 内存上限的防护）。
+ * 超限 → REQUEST_TOO_LARGE（调用方映射 413）；非法 JSON → INVALID_JSON（映射 400）。
+ */
+async function readBoundedJSON<T>(c: Context<AppEnv>, maxBytes: number = MAX_AI_REQUEST_BYTES): Promise<T> {
+  return readJSONLimited<T>(c.req.raw, maxBytes)
+}
+
+/** 把 RequestBodyError 映射为对外 JSON 错误响应（413/400），其余错误返回 null 交由调用方处理 */
+function requestBodyErrorResponse(c: Context<AppEnv>, err: unknown): Response | null {
+  if (!(err instanceof RequestBodyError)) return null
+  if (err.code === 'REQUEST_TOO_LARGE') {
+    return c.json({ error: { message: 'request body exceeds configured limit', type: 'invalid_request_error', code: 'REQUEST_TOO_LARGE' } }, 413)
+  }
+  return c.json({ error: { message: '请求体 JSON 格式错误', type: 'invalid_request_error', code: 'INVALID_JSON' } }, 400)
+}
+
+/** 处理 /v1/chat/completions 等 API 转发（HTTP 路径） */
+export async function handleProxy(c: Context<AppEnv>): Promise<Response> {
+  const url = new URL(c.req.url)
+  const route = getRoute(url)
+  const proxyKey = c.get('proxyKey') || null
+  const proxyKeyHash = c.get('proxyKeyHash') || ''
+  let context = createAnalyticsContext(c, proxyKey, proxyKeyHash, route, '', 'sync')
+
+  try {
+    const body = await readBoundedJSON<ProxyRequestBody>(c)
+    const model = body.model || ''
+    context = createAnalyticsContext(c, proxyKey, proxyKeyHash, route, model, isStreamRequest(body) ? 'stream' : 'sync')
+    const response = await forwardProxy(c, body, c.req.method)
+    return finalizeProxyResponse(c, response, applyUpstreamAttribution(c, context), route)
+  } catch (err) {
+    const bodyErr = requestBodyErrorResponse(c, err)
+    if (bodyErr) return bodyErr
+    const error = err as Error
+    writeAnalyticsEvent(c, {
+      context: applyUpstreamAttribution(c, context),
+      result: 'failure',
+      errorSummary: summarizeError(error),
+    })
+    return c.json({
+      error: { message: error.message || '代理转发内部错误', type: 'server_error' },
+    }, 500)
+  }
+}
+
+/**
+ * 把 forwardProxy 解析出的真实上游身份合并进 analytics context。
+ *
+ * context 在本函数调用 forwardProxy **之前**创建，那时 provider 还没解析出来，
+ * 写进 Analytics Engine 的 providerId/providerName/providerType/upstreamModel 会全是空串，
+ * 管理端「渠道 / 提供商」维度所有流量挤进一个空标签桶（按渠道查不到任何提供商）。
+ * forwardProxy 解析出 provider 后写进 c.get('analyticsUpstream')，这里取回补全。
+ * 未解析出 provider（如提供商不存在/禁用）时不编造，保持空值。
+ */
+function applyUpstreamAttribution(c: Context<AppEnv>, context: AnalyticsContext): AnalyticsContext {
+  const upstream = c.get('analyticsUpstream')
+  if (!upstream) return context
+  return {
+    ...context,
+    providerId: upstream.providerId,
+    providerName: upstream.providerName,
+    providerType: upstream.providerType,
+    upstreamModel: upstream.upstreamModel,
+  }
+}
+
+/**
+ * 转发核心逻辑：校验模型 → 路由到对应上游（OAuth 账号池 / Anthropic 原生 / 通用 Key 轮询），
+ * 返回上游 Response。HTTP 路径由 handleProxy 直接返回。
+ *
+ * @param method 请求方法，HTTP 路径默认取 c.req.method
+ */
+export async function forwardProxy(
+  c: Context<AppEnv>,
+  body: ProxyRequestBody,
+  method: string = c.req.method
+): Promise<Response> {
+  const model = body.model
+
+  if (!model) {
+      return c.json({ error: { message: '缺少 model 参数', type: 'invalid_request_error' } }, 400)
+    }
+
+    const parsed = parseModelId(model)
+    if (!parsed) {
+      return c.json({
+        error: {
+          message: `模型格式错误 "${model}"，请使用 提供商ID/模型ID 格式`,
+          type: 'invalid_request_error',
+        },
+      }, 400)
+    }
+
+    const { providerId, modelId } = parsed
+
+    // 转发 Key 模型权限检查
+    const proxyKey = (c as any).get('proxyKey') as import('./types').ProxyKey | undefined
+    if (proxyKey?.allowedModels && proxyKey.allowedModels.length > 0) {
+      if (!proxyKey.allowedModels.includes(model)) {
+        return c.json({
+          error: { message: `模型 "${model}" 不在当前 Key 的允许列表中`, type: 'permission_error' },
+        }, 403)
+      }
+    }
+
+    const provider = await getProvider(c.env, providerId)
+
+    if (!provider) {
+      return c.json({
+        error: { message: `提供商 "${providerId}" 不存在`, type: 'invalid_request_error' },
+      }, 404)
+    }
+
+    if (!provider.enabled) {
+      return c.json({
+        error: { message: `提供商 "${provider.name}" 已禁用`, type: 'provider_disabled' },
+      }, 403)
+    }
+
+    const modelConfig = provider.models.find((m) => m.id === modelId)
+    if (!modelConfig) {
+      // P6：允许未配置模型透传开关开启时跳过"未配置"校验，模型是否有效交由上游判断
+      //（适合模型频繁上架、不想每次后台手动加模型的提供商）。
+      if (!provider.allowUnlistedModels) {
+        return c.json({
+          error: { message: `模型 "${modelId}" 未在提供商 "${provider.name}" 中配置`, type: 'invalid_request_error' },
+        }, 404)
+      }
+    } else if (!modelConfig.enabled) {
+      return c.json({
+        error: { message: `模型 "${modelId}" 已禁用`, type: 'model_disabled' },
+      }, 403)
+    }
+
+    // analytics 归属：context 在 handleProxy 里、调用本函数之前就已创建，那时 provider
+    // 还没解析出来，写进 Analytics Engine 的渠道/提供商字段全是空串。这里把真实身份
+    // 记到请求上下文，由 handleProxy 合并回 context（否则管理端渠道维度只有一个空桶）。
+    c.set('analyticsUpstream', {
+      providerId: provider.id,
+      providerName: provider.name,
+      providerType: provider.apiType || 'openai',
+      upstreamModel: modelId,
+    })
+
+    const enabledKeys = provider.apiKeys.filter(k => k.enabled)
+    const forwardBody = { ...body, model: modelId }
+    // 缓存前缀注入：提供商勾选了该 modelId 时，在 messages 头部注入固定缓存前缀（提升前缀缓存命中率）
+    await applyCachePrefixInjection(c.env, provider, modelId, forwardBody as Record<string, unknown>)
+    // 思维模式引导注入：提供商勾选了该 modelId 时，在 messages 头部注入思维引导 system 提示词
+    await applyThinkingInjection(c.env, provider, modelId, forwardBody as Record<string, unknown>)
+    const url = new URL(c.req.url)
+    const subPath = url.pathname.replace(/^\/v1\//, '') || 'chat/completions'
+
+    // OAuth 设备码提供商：使用 KV 中保存的 access_token 转发，401 时尝试刷新后重试
+    if (provider.authType === 'oauth-device' && provider.oauth) {
+      return await proxyOAuthRequest(c, provider, subPath, url.search, forwardBody, method)
+    }
+
+    // Anthropic 原生上游（provider.apiType === 'anthropic'，如 api.anthropic.com）：
+    // 请求体/认证头/路径都转成 Anthropic 原生格式，响应再按客户端 route 转回 OpenAI
+    if (provider.apiType === 'anthropic' && subPath === 'chat/completions') {
+      return await proxyAnthropicNativeUpstream(
+        c,
+        provider,
+        providerId,
+        modelId,
+        forwardBody as Record<string, unknown>,
+        isStreamRequest(forwardBody as ProxyRequestBody),
+        'chat',
+      )
+    }
+
+    if (enabledKeys.length === 0) {
+      return c.json({
+        error: { message: `提供商 "${provider.name}" 未配置可用的 API Key`, type: 'configuration_error' },
+      }, 500)
+    }
+
+    const resolvedBase = resolveProviderBaseUrl(c.env, provider.baseUrl)
+    if (!resolvedBase) {
+      return c.json({
+        error: { message: `提供商 "${provider.name}" 的 baseUrl 含 {CF_ACCOUNT_ID} 占位符，但环境变量 CF_ACCOUNT_ID 未配置`, type: 'configuration_error' },
+      }, 500)
+    }
+    const cleanBase = resolvedBase.replace(/\/$/, '')
+    const forwardUrl = `${cleanBase}/${subPath}${url.search}`
+
+    // 按健康状态排序 key：健康→洗牌，不健康→末尾，冷却到期→试用，连续失败3次→降权排除
+    const healthData = await readHealth(c.env, providerId)
+    const healthy: number[] = []
+    const unhealthy: number[] = []
+    const probation: number[] = []
+    const demoted: number[] = []
+
+    if (enabledKeys.length === 1) {
+      // 只有一个 key，跳过健康检查，直接使用
+      healthy.push(0)
+    } else {
+      for (let i = 0; i < enabledKeys.length; i++) {
+        const h = healthData[enabledKeys[i].key]
+        if (h && h.failures >= KEY_HEALTH_MAX_FAILURES) {
+          // 兼容旧数据：无 demotedAt 视为现在刚降权，统一走冷却逻辑
+          if (!h.demotedAt) {
+            h.demotedAt = Date.now()
+          }
+          if (Date.now() - h.demotedAt >= KEY_HEALTH_COOLDOWN_MS) {
+            probation.push(i)  // 冷却到期，进入试用组
+          } else {
+            demoted.push(i)    // 仍在冷却，继续保持降权
+          }
+        } else if (h && h.lastFailed) {
+          unhealthy.push(i)
+        } else {
+          healthy.push(i)
+        }
+      }
+    }
+
+    // Fisher-Yates 洗牌（仅健康 key）
+    for (let i = healthy.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [healthy[i], healthy[j]] = [healthy[j], healthy[i]]
+    }
+
+    const keyOrder = [...healthy, ...unhealthy, ...probation]
+
+    // 所有 key 都在冷却中时，降级尝试 demoted key（修复旧数据缺失 demotedAt 的死循环）
+    if (keyOrder.length === 0 && demoted.length > 0) {
+      keyOrder.push(...demoted)
+      console.log(`[proxy] ${providerId}: all keys demoted, falling back to ${demoted.length} key(s)`)
+    }
+
+    if (demoted.length > 0 || probation.length > 0) {
+      console.log(`[proxy] ${providerId}: ${demoted.length} key(s) demoted, ${probation.length} key(s) on probation (cooldown expired)`)
+    }
+
+    let lastError: Response | null = null
+    let healthUpdated = false
+
+    for (const keyIndex of keyOrder) {
+      const apiKey = enabledKeys[keyIndex].key
+      // 提升到 try/catch 外层，供 catch 分支做瞬时错误重试时复用
+      const forwardHeaders: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        // P7：白名单前缀头（x- / anthropic- / user-）透传，供上游识别客户端
+        ...buildPassthroughHeaders(c),
+      }
+
+      const requestBody = JSON.stringify(forwardBody)
+      const isStream = isStreamRequest(forwardBody as ProxyRequestBody)
+      try {
+        // 瞬时错误自动重试：对同一 key 的瞬时 5xx / 网络抖动重试，
+        // 消除"偶发 500/断连，客户端重试一次又正常"的体验问题。
+        let response = await fetchUpstream(c.env, forwardUrl, {
+          method,
+          headers: forwardHeaders,
+          body: requestBody,
+        }, isStream)
+        let transientRetries = 0
+        while (isTransientStatus(response.status) && transientRetries < TRANSIENT_RETRY_MAX) {
+          transientRetries++
+          try { c.executionCtx.waitUntil(writeLog(c.env, 'warn', `[${provider.name}] ${model} → 瞬时 ${response.status}，${transientRetries}/${TRANSIENT_RETRY_MAX} 次重试`)) } catch {}
+          await new Promise((r) => setTimeout(r, TRANSIENT_RETRY_DELAY_MS * transientRetries))
+          response = await fetchUpstream(c.env, forwardUrl, {
+            method,
+            headers: forwardHeaders,
+            body: requestBody,
+          }, isStream)
+        }
+
+        if (response.ok) {
+          // 成功：重置健康状态
+          if (healthData[apiKey]?.failures > 0) {
+            delete healthData[apiKey]
+            healthUpdated = true
+          }
+          if (healthUpdated) await writeHealth(c.env, providerId, healthData)
+
+          try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[${provider.name}] ${model} → 200`, `provider=${providerId}`)) } catch {}
+          return passthroughResponse(response)
+        }
+
+        // 429 限流：跳过当前 key，不标记失败
+        if (response.status === 429) {
+          lastError = response
+          continue
+        }
+
+        // 401/403/5xx 尝试下一个 key（标记失败）
+        if (response.status === 401 || response.status === 403 || response.status >= 500) {
+          const h = healthData[apiKey] || { failures: 0, lastFailed: false }
+          h.failures++
+          h.lastFailed = true
+          if (h.failures >= KEY_HEALTH_MAX_FAILURES) {
+            h.demotedAt = Date.now()  // 达到降权阈值或试用失败，重置冷却计时
+          }
+          healthData[apiKey] = h
+          healthUpdated = true
+          lastError = response
+          continue
+        }
+
+        // 其他错误（400/404 等）直接返回。
+        // body 只能读一次：json() 失败后再 text() 会抛 "Body has already been used"，
+        // 改为先取全文再 JSON.parse。
+        const errRaw = await response.text().catch(() => '')
+        let errorData: any = { error: { message: errRaw || `HTTP ${response.status}` } }
+        try {
+          const parsed = JSON.parse(errRaw)
+          if (parsed && typeof parsed === 'object') errorData = parsed
+        } catch { /* 非 JSON，保留原文 */ }
+        try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[${provider.name}] ${model} → ${response.status} ${forwardUrl}`, JSON.stringify({ error: errorData, body: summarizeRequestBody(forwardBody), url: forwardUrl }).substring(0, 4000))) } catch {}
+        return c.json(errorData, response.status as Parameters<typeof c.json>[1])
+      } catch (err) {
+        const error = err as Error
+        // 网络异常/连接被重置等瞬时错误：对同一 key 短暂退避后重试 1 次，
+        // 多数情况下重试即恢复（对应客户端"重试一次又正常"的现象）。
+        let lastErr: Error = error
+        let netRetries = 0
+        while (netRetries < TRANSIENT_RETRY_MAX) {
+          netRetries++
+          try { c.executionCtx.waitUntil(writeLog(c.env, 'warn', `[${provider.name}] ${model} → 网络瞬时错误，${netRetries}/${TRANSIENT_RETRY_MAX} 次重试: ${String(error.message || error).substring(0, 200)}`)) } catch {}
+          await new Promise((r) => setTimeout(r, TRANSIENT_RETRY_DELAY_MS * netRetries))
+          try {
+            const retryResp = await fetchUpstream(c.env, forwardUrl, {
+              method,
+              headers: forwardHeaders,
+              body: requestBody,
+            }, isStream)
+            if (retryResp.ok) {
+              if (healthData[apiKey]?.failures > 0) {
+                delete healthData[apiKey]
+                healthUpdated = true
+                await writeHealth(c.env, providerId, healthData)
+              }
+              try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[${provider.name}] ${model} → 200（重试成功）`)) } catch {}
+              return passthroughResponse(retryResp)
+            }
+            // 重试返回了瞬时 5xx，继续下一轮；确定性错误则直接按原逻辑处理
+            if (!isTransientStatus(retryResp.status)) {
+              lastErr = new Error(`HTTP ${retryResp.status}`)
+              if (retryResp.status === 401 || retryResp.status === 403 || retryResp.status >= 500) {
+                const rh = healthData[apiKey] || { failures: 0, lastFailed: false }
+                rh.failures++
+                rh.lastFailed = true
+                if (rh.failures >= KEY_HEALTH_MAX_FAILURES) rh.demotedAt = Date.now()
+                healthData[apiKey] = rh
+                healthUpdated = true
+              }
+              lastError = retryResp
+              break
+            }
+          } catch (retryErr) {
+            lastErr = retryErr as Error
+          }
+        }
+        if (lastError) continue
+        // 重试耗尽仍失败，标记健康状态并切下一个 key
+        const h = healthData[apiKey] || { failures: 0, lastFailed: false }
+        h.failures++
+        h.lastFailed = true
+        if (h.failures >= KEY_HEALTH_MAX_FAILURES) {
+          h.demotedAt = Date.now()  // 达到降权阈值或试用失败，重置冷却计时
+        }
+        healthData[apiKey] = h
+        healthUpdated = true
+        lastError = new Response(JSON.stringify({
+          error: { message: lastErr.message || '请求失败', type: 'proxy_error' },
+        }), { status: 502 })
+        continue
+      }
+    }
+
+    // 写回健康状态
+    if (healthUpdated) await writeHealth(c.env, providerId, healthData)
+
+    // 所有 key 均失败
+    if (lastError) {
+      const errorBody = await lastError.text().catch(() => '所有 API Key 均失败')
+      return c.json({
+        error: {
+          message: `所有 API Key 已用完，最后一次错误: HTTP ${lastError.status}`,
+          type: 'key_exhausted',
+          detail: errorBody.substring(0, 500),
+        },
+      }, (lastError.status || 502) as Parameters<typeof c.json>[1])
+    }
+
+    return c.json({
+      error: { message: '没有可用的 API Key', type: 'configuration_error' },
+    }, 500)
+}
+
+/**
+ * OAuth 设备码提供商转发：取 token → 注入请求头 → 转发；401 时刷新 token 重试，
+ * 刷新后仍 401 则自动切换域重试（Global ↔ CN）。
+ * 参考 cpa-plugin/models.go 的域路由逻辑。
+ */
+/** 记录 OAuth 代理请求日志（复用 forwardProxy 的日志格式） */
+function logOAuthRequest(c: Context<AppEnv>, provider: import('./types').Provider, model: string, subPath: string, forwardBody: object, status: number) {
+  const logLevel = status >= 200 && status < 300 ? 'request' : (status >= 500 ? 'error' : 'warn')
+  try {
+    const bodySummary = summarizeRequestBody(forwardBody as Record<string, unknown>)
+    c.executionCtx.waitUntil(writeLog(c.env, logLevel,
+      `[${provider.name}] ${model} → ${status}`,
+      JSON.stringify({ providerId: provider.id, subPath, body: bodySummary }).substring(0, 4000)
+    ))
+  } catch { /* log failure must not break */ }
+}
+
+/**
+ * WorkBuddy 多账号池转发核心：每请求最多轮转 MAX_OAUTH_ROTATE 个账号。
+ * 挑号（三因子加权随机：credits 比例×10 + 闲置补偿 + 成功率×3，Top5 内抽签 + 100ms 防惊群；
+ * 无健康账号时从冷却账号选最早到期者兜底顶班，禁用与余额耗尽号不参与）→ 临近过期先刷新 → 转发；
+ * 失败按错误分类（移植 workbuddy2api Classify）施加账号策略并换号：
+ *   401/403（session 失效）→ 先刷新一次，仍失败禁用该账号；
+ *   402/余额关键词 → 硬冷却到次日 04:00（等签到恢复，签到后 credits>0 自动解冻）；
+ *   429 → 短冷却；404 → 短冷却（不累计 errCount，防雪崩）；5xx → 累计错误达阈值冷却；
+ *   12153/session 死亡 → 永久禁用；其他 4xx（客户端问题）→ 不处罚账号，仅换号。
+ * 成功返回原始上游 Response（由调用方决定透传/聚合/转 Anthropic）；无可用账号抛错。
+ */
+/** 11102「后端无此模型」指数退避命中计数（运行态，不落盘；重启归零，对齐 workbuddy2api）。 */
+const modelBlockHits = new Map<string, number>()
+const MODEL_BLOCK_BASE_MS = 6 * 60 * 60 * 1000 // 起点 6h
+const MODEL_BLOCK_MAX_MS = 24 * 60 * 60 * 1000 // 封顶 24h
+
+async function proxyOAuthRequestPooledCore(
+  c: Context<AppEnv>,
+  provider: import('./types').Provider,
+  subPath: string,
+  search: string,
+  forwardBody: object,
+  method: string = c.req.method
+): Promise<{ response: Response; originalStream: boolean; account?: OAuthPoolAccount }> {
+  const cfg = provider.oauth!
+  const cd = resolveOauthCooldown(provider)
+  // 单账号在途上限（对齐 workbuddy2api pool.max_in_flight；0/未配置 → 默认 3）
+  const maxInFlight = resolveMaxInFlight(provider)
+  // global 域单独在途档（对齐 workbuddy2api 2680f4c pool.max_in_flight_global；0/未配置 → 回落 maxInFlight 不分档）
+  const maxInFlightGlobal = resolveMaxInFlightGlobal(provider)
+  // 在途占满过滤回调（realm 由账号 token 判定，cn/global 分档；对齐 workbuddy2api 2680f4c）
+  const isFull = (uid: string, account?: OAuthPoolAccount) =>
+    isInFlightFull(provider.id, uid, maxInFlight, account?.token?.access_token ? resolveRealm(account.token.access_token) : undefined, maxInFlightGlobal)
+  const reqModel = typeof (forwardBody as Record<string, unknown>)?.['model'] === 'string'
+    ? (forwardBody as Record<string, unknown>)['model'] as string
+    : undefined
+
+  // 11102「后端无此模型」避让计数（运行态内存，重启归零；对齐 workbuddy2api 不落盘红线）：
+  // 指数退避用 hits 决定冷却时长，不写 KV（11102 天然是"该模型不存在"的稳定态，非计费状态）。
+  const modelBlockKey = `${provider.id}:${reqModel || ''}`
+
+  // 兼容迁移：池空时把既有单 token 种子进池
+  try { await seedOauthPoolFromSingle(c.env, provider.id) } catch { /* ignore */ }
+
+  // 会话头族（移植 workbuddy2api issue #35）：在**轮转循环外**生成一次，循环内每次出站复用
+  // → 换号/重试/降级全部同 X-Conversation-Request-ID，上游后台按对话轮聚合而非逐请求碎片化。
+  // 关键时序：必须在 body 改写（sanitize/tool_choice/thinking）之前取 turnKey——改写会动
+  // messages 内容，改写后取的键会随 step 漂移（对齐 workbuddy2api handler.go:406-414 的注释）。
+  // 非 chat 路径（如 models）无"对话轮"语义，不生成（传 undefined 即不注入头族）。
+  let chatMeta: ChatMeta | undefined
+  if (isWorkbuddyProvider(provider) && subPath === 'chat/completions') {
+    const bodyObj = forwardBody as Record<string, unknown>
+    const sessKey = extractSessionKey(bodyObj)
+    chatMeta = await buildChatMeta({
+      body: bodyObj,
+      sessionKey: sessKey,
+      inboundConversationRequestId: c.req.header('X-Conversation-Request-ID') || undefined,
+      inboundTraceId: c.req.header('X-Trace-ID') || undefined,
+    })
+  }
+
+  const resolveRealm = (token: string): 'cn' | 'global' => {
+    return detectTokenRealm(token) === 'global' ? 'global' : 'cn'
+  }
+  const buildForwardUrl = (realm: 'cn' | 'global') => {
+    const realmBase = (realm === 'global' && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
+    return `${realmBase}/${subPath}${search}`
+  }
+  const buildOrigin = (realm: 'cn' | 'global') => {
+    return realm === 'global' && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
+  }
+  // 备用域（401 自动切换用）：CN token 不尝试 Global 域（必然 401）
+  const altRealm = (realm: 'cn' | 'global'): 'cn' | 'global' | null => {
+    if (realm === 'cn') return null
+    return 'cn'
+  }
+
+  const doFetch = (token: string, cookies: string | undefined, realm?: 'cn' | 'global', account?: OAuthPoolAccount, systemOverride?: string) => {
+    const r = realm || resolveRealm(token)
+    const body = { ...forwardBody } as Record<string, unknown>
+    // 捕获客户端原始 stream 意图（force 前），供非流式聚合判断
+    const originalStream = body.stream === true
+    if (isWorkbuddyProvider(provider)) {
+      // reasoning_effort 降级（移植 workbuddy2api）：sanitize 删除前先捕获，
+      // 档位来源见 resolveWorkbuddyEfforts（运营者手填 effortPolicy 优先，其次探测缓存）
+      const capturedEffort = captureWorkbuddyReasoningEffort(body)
+      if (body.stream !== true) body.stream = true
+      // stream_options 补 include_usage（移植 workbuddy2api D7）：上游据此在末帧回 usage，
+      // 成本账本（recordOauthModelCost）依赖它；未带才注入，显式带则尊重调用方
+      ensureWorkbuddyStreamOptions(body)
+      ensureWorkbuddyMaxTokens(body)
+      sanitizeUpstreamBody(body)
+      sanitizeBlockedTemplates(body)
+      normalizeOpenAIToolChoice(body)
+      // image_url 形状归一（字符串 → {url}）：上游只认 OpenAI 对象形态（移植 c5cdb46）
+      normalizeWorkbuddyImageURL(body)
+      if (capturedEffort) {
+        const model = typeof body['model'] === 'string' ? body['model'] : ''
+        applyWorkbuddyReasoningEffort(body, capturedEffort, resolveWorkbuddyEfforts(cfg, provider.id, model))
+      }
+      // DeepSeek 思维链注入与历史消息一致性回填（对齐 workbuddy2api thinking.go）
+      injectDeepSeekThinking(body)
+      backfillReasoningContent(body)
+      // global 兜底 system 注入（对齐 workbuddy2api ensureConsoleSystem / PR #45）。
+      // 必须放在这里（per-account realm 已确定）：池内可能混有 CN 与 global 账号，
+      // 各自 realm 不同，不能在上层统一注入。仅 chat 路径（非 chat 无 messages 语义）。
+      if (r === 'global' && subPath === 'chat/completions') {
+        ensureGlobalFallbackSystem(body)
+      }
+      // 系统提示词体系（移植 workbuddy2api internal/prompt）：
+      //  - custom：用自有提示词整体替换 system/developer（覆盖上面注入的兜底 system，避免双 system）；
+      //  - append（移植 ff64ecd）：在开头连续 system/developer 块之后**追加**一条网关 system，
+      //    既有消息逐字不动（客户端项目规范与网关提示词并用）；
+      //  - passthrough 降级重试：调用方传 systemOverride（中性提示词）时**替换**——
+      //    append 带指纹原文重试是确定性再撞墙，降级期必须退化成 replace（对齐源 9288f55）。
+      if (systemOverride) {
+        rewriteWorkbuddySystemPrompt(body, systemOverride)
+      } else if (provider.promptMode === 'custom' && provider.promptText) {
+        rewriteWorkbuddySystemPrompt(body, provider.promptText)
+      } else if (provider.promptMode === 'append' && provider.promptText) {
+        appendWorkbuddySystemPrompt(body, provider.promptText)
+      }
+    }
+    const headers = buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies })
+    if (isWorkbuddyProvider(provider)) {
+      injectWorkbuddyChatHeaders(headers, token, r, account?.token, cfg, { chatPath: subPath === 'chat/completions', chatMeta })
+    }
+    return fetchUpstream(c.env, buildForwardUrl(r), {
+      method,
+      headers,
+      body: method === 'GET' || method === 'HEAD' ? undefined : JSON.stringify(body),
+    }, (body as Record<string, unknown>).stream === true || isWorkbuddyProvider(provider)).then(resp => ({ resp, originalStream }))
+  }
+
+  const doFetchWithRetry = async (token: string, cookies: string | undefined, realm?: 'cn' | 'global', account?: OAuthPoolAccount, systemOverride?: string) => {
+    let result = await doFetch(token, cookies, realm, account, systemOverride)
+    let transientRetries = 0
+    // 用 isRetryableUpstreamResponse 而非 isTransientStatus：把「403 + 无业务信封」
+    // （WAF / CF 边缘拦截页）也纳入原地重试，避免一次边缘抖动就冷却一个健康账号。
+    while (transientRetries < OAUTH_TRANSIENT_RETRY_MAX && await isRetryableUpstreamResponse(result.resp)) {
+      transientRetries++
+      try { c.executionCtx.waitUntil(writeLog(c.env, 'warn', `[${provider.name}] ${reqModel || ''} → 瞬时 ${result.resp.status}，同号重试 ${transientRetries}/${OAUTH_TRANSIENT_RETRY_MAX}`)) } catch {}
+      await new Promise((r) => setTimeout(r, TRANSIENT_RETRY_DELAY_MS * transientRetries))
+      // 重试前必须放掉上一次的响应体：流式响应未消费的 body 会占住连接（Workers 有并发连接上限）。
+      try { await result.resp.body?.cancel() } catch { /* 已消费/已取消：忽略 */ }
+      result = await doFetch(token, cookies, realm, account, systemOverride)
+    }
+    return result
+  }
+
+  const tried = new Set<string>()
+  let lastErr: Error | null = null
+  // 系统提示词降级：本请求内是否已用过中性提示词重试（仅统一应用一次）。
+  let degradedApplied = false
+
+  // 轮转间指数退避（对齐 workbuddy2api 64eb4aa rotateBackoff）：第 i 次轮转失败换号前
+  // 等 rotateBackoffAfterMs(i)（500ms·2^i 封顶 8s ±25% 抖动），让上游频控窗口滑过。
+  // ctx 取消（客户端断连/优雅停机）时按 workbuddy2api 语义应 break 终止轮转，不再换号打上游。
+  // 此处 ctx 是不可取消的 request context（Workers 无真正的 AbortSignal 贯穿），故退避值
+  // 仍应用（防风控），不做取消短路——以 Worker 平台的现实为准，避免死等。
+  const backoffAt = async (i: number): Promise<void> => {
+    const ms = rotateBackoffAfterMs(i)
+    if (ms > 0) await new Promise((r) => setTimeout(r, ms))
+  }
+
+  // 会话粘性（移植 workbuddy2api internal/session/session.go）：同一会话尽量绑定同一账号，
+  // 避免多轮跳号导致上游 prompt cache 失效与上下文不一致。
+  // 仅在首轮用粘性号（i === 0）；轮转失败后该号进 tried，自然换号。
+  // 注意：粘性命中校验带**模型维度**——绑定号若被 6004 模型级限额（对其他模型仍可用），
+  // 必须重分配，否则会话会被钉在"对当前模型不可用"的号上反复失败。
+  const sessKey = chatMeta ? extractSessionKey(forwardBody as Record<string, unknown>) : ''
+  // stickyKey 是**粘性专用**键，与 sessKey（会话头族聚合用）分开（移植 workbuddy2api
+  // 8058019）：sessKey 为空时（OpenAI 兼容客户端——dsh / Codex 等既无 conversationId
+  // 也无 metadata）回落首条 user 消息派生的会话级 fallback 键，使粘性仍能生效。
+  // 不能直接改 sessKey：那会连带改变会话头族 requestIdForKey 的聚合语义。
+  // stickyFallbackKey 内部已抑制带 user_id 的请求（10eefa8，P1-anti-monopoly 契约）。
+  const stickyKey = sessKey || (chatMeta ? await stickyFallbackKey(forwardBody as Record<string, unknown>) : '')
+  let stickyUid = ''
+  if (stickyKey) {
+    const poolNow = await readOauthPool(c.env, provider.id)
+    const availability = (uid: string): boolean => {
+      const acc = poolNow.find((a) => a.uid === uid)
+      return !!acc && isOauthAccountHealthy(acc, Date.now(), reqModel)
+    }
+    const resolved = await resolveSticky(c.env, provider.id, stickyKey, availability)
+    if (resolved.hit) stickyUid = resolved.uid
+  }
+
+  for (let i = 0; i < MAX_OAUTH_ROTATE; i++) {
+    // 挑号（三因子加权随机）+ 全冷却兜底：无健康账号时从冷却账号选最早到期者顶班
+    //（对齐 workbuddy2api pickEarliestExpiry；禁用与余额耗尽号永不参与兜底）
+    // 优先级：粘性命中号（仅首轮）> 面板手工指定 preferOauthUid（仅首轮）> 三因子加权
+    // 在途占满的号被排除（对齐源实现 pick.go:63-65 inFlightFull）
+    const preferUid = i === 0 ? (stickyUid || provider.preferOauthUid) : undefined
+    const account = await pickOauthAccount(c.env, provider.id, tried, preferUid, {
+      allowCoolingFallback: true,
+      reqModel,
+      isInFlightFull: isFull,
+    })
+    if (!account) break
+    tried.add(account.uid)
+
+    // 在途租约：占用一个名额。pick 已排除满号，此处是并发竞态的兜底（同 isolate 内
+    // JS 单线程使 acquire 天然原子，故竞态窗口极小；失败即换号）。
+    if (!acquireInFlight(provider.id, account.uid, maxInFlight, account.token?.access_token ? resolveRealm(account.token.access_token) : undefined, maxInFlightGlobal)) {
+      await backoffAt(i)
+      continue
+    }
+    // 本账号的在途名额必须在本轮任何出口释放（成功 return / 各 continue / 抛错）。
+    // 用 try/finally 包裹"本轮处理"，避免遗漏任一分支导致名额泄漏（泄漏会让该号
+    // 永久被判满、不再被选中）。
+    let released = false
+    const releaseOnce = () => {
+      if (!released) {
+        released = true
+        releaseInFlight(provider.id, account.uid)
+      }
+    }
+
+    try {
+    // 临近过期 → 先刷新（写回池）
+    let token = account.token.access_token
+    if (account.token.refresh_token && account.token.expires_at - Date.now() < OAUTH_TOKEN_REFRESH_MARGIN_MS) {
+      try {
+        const refreshed = await refreshOauthPoolAccount(c.env, provider.id, account.uid, cfg)
+        if (refreshed) token = refreshed.token.access_token
+      } catch { /* 刷新失败继续用旧 token，走 401 兜底 */ }
+    }
+    if (!token) {
+      await disableOauthAccount(c.env, provider.id, account.uid, 'no access token')
+      await backoffAt(i)
+      continue
+    }
+
+    const primaryRealm = resolveRealm(token)
+    let { resp: response, originalStream } = await doFetchWithRetry(token, account.token.cookies, undefined, account)
+
+    // WAF 403 拦截形态（403 + 无业务信封：APISIX 拦截页/空体/纯文本，对齐 workbuddy2api 76fafa6）：
+    // 必须**先于**下方 401/403→刷新→禁用 路径——否则 WAF 403 会被误判成「session dead」而
+    // 永久禁用健康账号（WAF 是 IP/指纹维频控信号，账号本身健康，罚过即走、到期自愈）。
+    //   - 软冷却：Retry-After 头优先，缺失按 cd.softMs 固定浅冷却（复用 429 语义，不建平行系统）；
+    //   - 不 feed 累计连续性错误计数（noteOauthError）——WAF 频控不是账号故障，禁连环冷却；
+    //   - 不禁用、不粘性解绑需要刚性理由（账号健康，仅瞬时风控）。
+    if (response.status === 403) {
+      const wafText = await response.text().catch(() => '')
+      if (isWafBlocked(response.status, wafText)) {
+        const raMs = parseRetryAfterMs(response.headers)
+        const wafCdMs = raMs !== null ? raMs : cd.softMs
+        await cooldownOauthAccount(c.env, provider.id, account.uid, wafCdMs, raMs !== null ? 'waf 403 block (retry-after)' : 'waf 403 block')
+        // 粘性解绑：WAF 频控带 IP/指纹粘性，本轮撞 WAF 解绑让会话下一跳重新分配。
+        if (stickyKey && account.uid === stickyUid) {
+          await unbindSticky(c.env, provider.id, stickyKey)
+          stickyUid = ''
+        }
+        lastErr = new Error(`account ${account.uid} waf 403 blocked`)
+        await backoffAt(i)
+        continue
+      }
+    }
+
+    // 401/403 分流（2026-10-18，用户批准的「仅会话吊销才停用」口径，与 Qoder 对齐）：
+    // **先分清「会话真的死了」还是「上游临时拒绝」，再决定停用还是轮换**。
+    // 旧实现只要「刷新 + 备用域」后仍是 401/403 就 disableOauthAccount('session dead (401/403)')，
+    // 于是 APISIX 边缘 401（网关/指纹拦截、凭证尚未生效）、瞬时抖动、token 域错配都会把一个
+    // **完全有效**的账号永久踢出选号——用户实测面板「已禁用」而积分照涨、签到成功，只有本地标记，
+    // 且没有任何自愈路径（签到解冻旧实现带 `!st.disabled` 守卫，见 reenableOauthIfCredits）。
+    // 三条判据（响应体只能读一次，故先取文本再分流）：
+    //   - 会话吊销（12153 / Offline user session not found）→ 连续 3 次防抖后停用；
+    //   - 11140 request illegal（账号级授权封禁，需重新 OAuth 登录，软冷却不会自愈）→ 立即停用；
+    //   - 其余 401/403（边缘拦截页、空体、未知信封）→ 软冷却 + 粘性解绑 + 本轮换号，**不停用**。
+    // 停止用不等于放行：该号仍被 until 冷却挡在挑号之外，只是 60s 后有机会自证清白，
+    // 而不是一次未识别的 401 就永久报废（真正的死会话由 12153 判据在 3 次内收敛）。
+    if (response.status === 401 || response.status === 403) {
+      let refreshedToken: string | null = null
+      if (account.token.refresh_token) {
+        const refreshed = await refreshOauthPoolAccount(c.env, provider.id, account.uid, cfg)
+        if (refreshed) refreshedToken = refreshed.token.access_token
+      }
+      if (refreshedToken) {
+        const retry = await doFetchWithRetry(refreshedToken, account.token.cookies, undefined, account)
+        if (retry.resp.ok || retry.resp.status !== 401) {
+          response = retry.resp
+          originalStream = retry.originalStream
+        }
+      }
+      // 刷新后仍 401 → 尝试备用域一次
+      if (response.status === 401) {
+        const alt = altRealm(primaryRealm)
+        if (alt) {
+          const altResult = await doFetchWithRetry(refreshedToken || token, account.token.cookies, alt, account)
+          if (altResult.resp.ok || altResult.resp.status !== 401) {
+            response = altResult.resp
+            originalStream = altResult.originalStream
+          }
+        }
+      }
+      if (response.status === 401 || response.status === 403) {
+        const text = await response.text().catch(() => '')
+        if (classifyWorkbuddyUpstreamError(response.status, text) === 'session_dead') {
+          await noteOauthSessionDead(c.env, provider.id, account.uid, cd)
+        } else if (isAccountBanned(text)) {
+          await disableOauthAccount(c.env, provider.id, account.uid, 'account banned by upstream (11140 request illegal), re-login required')
+        } else {
+          await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, `upstream ${response.status} (rotate, no disable)`)
+        }
+        // 粘性解绑：失败号若是本会话的绑定号，下次请求重新分配（对齐 session.go Unbind）
+        if (stickyKey && account.uid === stickyUid) {
+          await unbindSticky(c.env, provider.id, stickyKey)
+          stickyUid = ''
+        }
+        lastErr = new Error(`account ${account.uid} upstream ${response.status}`)
+        await backoffAt(i)
+        continue
+      }
+    } else if (!response.ok) {
+      // 错误分类细化（移植 workbuddy2api Classify）：按「真实原因」施加账号策略，而非只看状态码
+      const text = await response.text().catch(() => '')
+      const kind = classifyWorkbuddyUpstreamError(response.status, text)
+      switch (kind) {
+        case 'hard_credit':
+          // 余额/权益耗尽 → 硬冷却到次日 04:00（等签到恢复，签到后 credits>0 自动解冻）
+          await cooldownOauthAccountUntilTomorrow4AM(c.env, provider.id, account.uid, '余额不足')
+          break
+        case 'model_rate': {
+          // 429 6004 模型级限流（切模型立即可用，对齐 workbuddy2api issue #31）。
+          //
+          // **单位契约**：cooldownOauthAccountSoftForModel 第 5 参是**绝对 epoch 截止时刻**
+          // （见 oauth-pool 的 untilMs 语义，单元测试全部按绝对时刻传参）。2026-10-03 前这里
+          // 传的是「时长」（resetAt - now）→ 落进 `untilMs > now ? untilMs : now + 1` 的兜底，
+          // 冷却恒为 now+1ms：模型级豁免形同虚设，同模型下一请求继续硬撞上游，面板也永远只会
+          // 显示「无冷却（上次：… 6004）」。报文给的 UTC+8 墙钟按 2h 上限封顶（同 Retry-After
+          // 头族的异常值口径），不可信/缺失时才回落本地软冷却时长。
+          const resetAt = parseSoftRateReset(text)
+          const now = Date.now()
+          const untilMs = resetAt !== null
+            ? Math.min(resetAt, now + RETRY_AFTER_SANITY_MS)
+            : now + cd.softMs
+          await cooldownOauthAccountSoftForModel(c.env, provider.id, account.uid, reqModel || '', untilMs, '429 model rate limit (6004)')
+          break
+        }
+        case 'soft_rate': {
+          // 429 限流 → 短冷却。优先采信上游明示的 Retry-After 头族（与 WAF / 5xx / 404 分支
+          // 同一口径：上游说多久就多久），缺失/非法才回落本地默认 softMs（旧语义不变）。
+          const raMs = parseRetryAfterMs(response.headers)
+          await cooldownOauthAccount(
+            c.env,
+            provider.id,
+            account.uid,
+            raMs !== null ? raMs : cd.softMs,
+            raMs !== null ? '429 rate limit (retry-after)' : '429 rate limit'
+          )
+          break
+        }
+        case 'model_blocked': {
+          // 11102「该后端无此模型」→ 模型级避让（对齐 workbuddy2api BlockModelBackoff）：
+          // 只写 modelCooldowns[model] 独立冷却，指数退避（6h 起 ×2^min(hits-1,6) 封顶 24h），
+          // 不碰账号级 until → 其他模型/切账号仍可用；成功路径 BlockModelClear 即时解除。
+          const hits = (modelBlockHits.get(modelBlockKey) || 0) + 1
+          modelBlockHits.set(modelBlockKey, hits)
+          const backoffMs = Math.min(MODEL_BLOCK_BASE_MS * Math.pow(2, Math.min(hits - 1, 6)), MODEL_BLOCK_MAX_MS)
+          await cooldownOauthAccountSoftForModel(c.env, provider.id, account.uid, reqModel || '', Date.now() + backoffMs, 'model not found (11102)')
+          break
+        }
+        case 'not_found':
+          // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
+          await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, 'upstream 404')
+          break
+        case 'session_dead':
+          // session 失效（12153/offline）→ 连续 3 次防抖：前 2 次短冷却，第 3 次永久禁用（对齐 workbuddy2api noteSessionDead）
+          await noteOauthSessionDead(c.env, provider.id, account.uid, cd)
+          break
+        case 'account_fault':
+          // 账号级授权/配额故障（对齐 workbuddy2api handler.applyErrorPolicy 的 ErrAccountFault 分支）。
+          // 按 msg 分野，两条策略可恢复性不同：
+          //  - 11140 "request illegal"：账号级授权封禁，软冷却到期也不会自愈（需重新 OAuth 登录），
+          //    到期后重新选号只会再撞 403 浪费一次轮换 → 硬禁用（不再参与选号，需重登恢复）；
+          //  - 14017 "trial not activated"：register 未完成，补完 register 后可能自愈 →
+          //    保持软冷却（禁用会让用户补完 register 后仍无法用）。
+          if (isAccountBanned(text)) {
+            await disableOauthAccount(c.env, provider.id, account.uid, 'account banned by upstream (11140 request illegal), re-login required')
+          } else {
+            await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, 'account fault (14017)')
+          }
+          break
+        case 'server':
+          // 5xx 上游故障。优先采信 Retry-After 头（对齐 workbuddy2api 76fafa6 P1-2）：
+          // 上游明示恢复时刻时按该时刻软冷却，**不喂连续错误计数**——避免偶发 5xx 把
+          // 好账号钉进 noteOauthError 连环冷却（这正是「全池无可用账号」的元凶之一）。
+          // 无 Retry-After 头才回落既有语义（累计错误计数，达阈值自动冷却）。
+          {
+            const raMs = parseRetryAfterMs(response.headers)
+            if (raMs !== null) {
+              await cooldownOauthAccount(c.env, provider.id, account.uid, raMs, `server 5xx (retry-after)`)
+            } else {
+              await noteOauthError(c.env, provider.id, account.uid, cd)
+            }
+          }
+          break
+        case 'waf_block':
+          // WAF 403（无业务信封拦截形态）软冷却：**不禁用**。已在上方 401/403 之前拦截，
+          // 此处为防御性双保险（正常走不到）；重合逻辑与上文 WAF 分支一致。
+          {
+            const raMs = parseRetryAfterMs(response.headers)
+            await cooldownOauthAccount(c.env, provider.id, account.uid, raMs !== null ? raMs : cd.softMs, raMs !== null ? 'waf 403 block (retry-after)' : 'waf 403 block')
+          }
+          break
+        case 'content_blocked':
+          // 内容命中网关防火墙：**立即终止本请求，不轮转**（对齐 workbuddy2api handler.go:571-582）。
+          // 理由：内容问题是**请求本身**的问题，换任何账号都会撞同一审核——轮转纯属浪费
+          // 上游请求并放大风控。且不罚账号（该号余额/会话都健康）。
+          // 抛出专用错误由外层入口转为 400 + 防火墙文案（避免暴露业务 code 与账号/冷却语义）。
+          // —— 前置一步：系统提示词降级自愈（默认 passthrough，移植 workbuddy2api handler.go）：
+          //   content_blocked 很可能是 system 指纹误报（非 custom 且本请求尚未降级过），
+          //   换 WORKBUDDY_DEGRADED_PROMPT 中性提示词同账号重试一次；仍被拦才回内容墙。
+          //   append 模式共享同一 degradeGate（对齐源 9288f55）：降级期走 replace 退化。
+          if (provider.promptMode !== 'custom' && !degradedApplied) {
+            dedicatedDegrade: {
+              degradedApplied = true
+              const degraded = await doFetchWithRetry(token, account.token.cookies, undefined, account, WORKBUDDY_DEGRADED_PROMPT)
+              if (!degraded.resp.ok) break dedicatedDegrade
+              const dResp = degraded.resp
+              const dStream = degraded.originalStream
+              await noteOauthSuccess(c.env, provider.id, account.uid)
+              await clearOauthSessionDead(c.env, provider.id, account.uid)
+              if (reqModel) {
+                modelBlockHits.delete(modelBlockKey)
+                await clearOauthAccountModelCooldown(c.env, provider.id, account.uid, reqModel)
+              }
+              if (stickyKey && account.uid !== stickyUid) {
+                await bindSticky(c.env, provider.id, stickyKey, account.uid)
+              }
+              releaseOnce()
+              return { response: dResp, originalStream: dStream, account }
+            }
+            // 降级重试仍被拦 → 用户内容本身触发审核，回内容墙
+          }
+          if (stickyKey && account.uid === stickyUid) {
+            await unbindSticky(c.env, provider.id, stickyKey)
+          }
+          throw new ContentBlockedError(text)
+        case 'prompt_too_long':
+          // 11115「prompt is too long」（移植 workbuddy2api 5f26ce3 分类 + f41c496 透传）：
+          // 上下文超限是**请求的问题不是账号的问题**——同一 body 换任何账号都超限，轮转只会
+          // 白扔健康号配额。**不罚号**（零冷却/零连败/零熔断）、**不轮转**（直接终态返回），
+          // 400 + 上游 body 原文透传（真实 token 数/上限值/requestId 都保留，禁止固定词覆盖）。
+          if (stickyKey && account.uid === stickyUid) {
+            await unbindSticky(c.env, provider.id, stickyKey)
+          }
+          throw new WorkbuddyClientError(response.status, text, 'prompt_too_long')
+        case 'image_invalid':
+          // 图片格式/数据无效（400 + 11135 家族，移植 c5cdb46 的 ErrImageInvalid 分支）：
+          // 同 body 换任何账号都得到相同的解析错误——**不罚号、不轮转**，400 原文透传。
+          // 与 prompt_too_long 同待遇；差异只在出口附 `image_invalid` type 与定向 gateway_hint
+          // （源实现 writeOpenAIErrorHint 的 image_invalid 形态）。
+          if (stickyKey && account.uid === stickyUid) {
+            await unbindSticky(c.env, provider.id, stickyKey)
+          }
+          throw new WorkbuddyClientError(response.status, text, 'image_invalid')
+        case 'bad_params':
+        case 'client':
+        default:
+          // 客户端请求问题（400 参数错/超长/畸形 JSON 等）：请求本身的问题，换任何账号都会撞同一错误。
+          // 不处罚账号（防雪崩），立即终止本请求，不轮转，直接向客户端透传 4xx 与上游原因，
+          // 避免轮空整个账号池后误报「503 OAuth 账号池无可用账号」。
+          if (stickyKey && account.uid === stickyUid) {
+            await unbindSticky(c.env, provider.id, stickyKey)
+          }
+          throw new WorkbuddyClientError(response.status, text)
+      }
+      // 粘性解绑：失败号若是本会话的绑定号，下次请求重新分配
+      if (stickyKey && account.uid === stickyUid) {
+        await unbindSticky(c.env, provider.id, stickyKey)
+        stickyUid = ''
+      }
+      lastErr = new Error(`account ${account.uid} http ${response.status} (${kind})`)
+      await backoffAt(i)
+      continue
+    }
+
+    // 成功：记账成功，重置 session dead 计数，返回原始上游响应
+    await noteOauthSuccess(c.env, provider.id, account.uid)
+    await clearOauthSessionDead(c.env, provider.id, account.uid)
+    // BlockModelClear：该模型实测成功 → 立即解除 11102 避让并重置命中计数（对齐 workbuddy2api）
+    if (reqModel) {
+      modelBlockHits.delete(modelBlockKey)
+      await clearOauthAccountModelCooldown(c.env, provider.id, account.uid, reqModel)
+    }
+    // 粘性跟随最终成功号（对齐 session.go:190-193）：本轮成功的账号成为该会话的绑定，
+    // 覆盖旧绑定。若粘性号失败后轮换到别的号成功，这里把会话重绑到新号，
+    // 多轮对话下一跳不再随机抽 → 保住新号上的 prompt cache。
+    if (stickyKey && account.uid !== stickyUid) {
+      await bindSticky(c.env, provider.id, stickyKey, account.uid)
+    }
+    // 释放本轮在途名额：上游已返回响应头，租约使命完成。
+    // 流式场景下 body 由外层 passthroughResponse 消费——源实现的 inFlight 同样在
+    // "拿到响应"后即释放（不覆盖整个 body 消费期），此处保持一致语义。
+    releaseOnce()
+    return { response, originalStream, account }
+    } finally {
+      // 兜底：任何 continue / 抛错路径都必须释放，避免名额泄漏使该号永久被判满。
+      releaseOnce()
+    }
+  }
+
+  throw new Error('no healthy account (cooling/disabled)' + (lastErr ? ': ' + lastErr.message : ''))
+}
+
+/** WorkBuddy 多账号池 OpenAI 转发入口（透传/聚合 + 错误 JSON）。 */
+async function proxyOAuthRequestPooled(
+  c: Context<AppEnv>,
+  provider: import('./types').Provider,
+  subPath: string,
+  search: string,
+  forwardBody: object,
+  method: string = c.req.method
+): Promise<Response> {
+  const model = (forwardBody as Record<string, unknown>).model as string
+  try {
+    const { response, originalStream, account } = await proxyOAuthRequestPooledCore(c, provider, subPath, search, forwardBody, method)
+    const uid = account?.uid || ''
+    // WorkBuddy 非流式请求：收集 SSE 流并聚合成非流式 chat.completion 返回
+    if (response.ok && originalStream !== true && isWorkbuddyProvider(provider) && response.body) {
+      try {
+        const aggregated = await aggregateWorkbuddySSE(response.body, model, sanitizeUpstreamError)
+        if (!aggregated.ok) {
+          // 上游在流内报错（6004 限流 / 审核 / 会话失效）：按错误返回，**不产出 200 + 空内容**。
+          // 口径 = 语义透传 + 网关脱敏（见 workbuddyStreamErrorResponse）。
+          const errResp = workbuddyStreamErrorResponse(aggregated.error)
+          logOAuthRequest(c, provider, model, subPath, forwardBody, errResp.status)
+          return errResp
+        }
+        if (uid && model) {
+          try {
+            const parsedAgg = JSON.parse(aggregated.body)
+            if (parsedAgg.usage && typeof parsedAgg.usage.credit === 'number') {
+              const pt = typeof parsedAgg.usage.prompt_tokens === 'number' ? parsedAgg.usage.prompt_tokens : 0
+              const ct = typeof parsedAgg.usage.completion_tokens === 'number' ? parsedAgg.usage.completion_tokens : 0
+              const total = pt + ct
+              recordOauthModelCost(provider.id, uid, model, parsedAgg.usage.credit, total > 0 ? total : 1)
+            }
+          } catch { /* ignore parse error */ }
+        }
+        logOAuthRequest(c, provider, model, subPath, forwardBody, 200)
+        return new Response(aggregated.body, {
+          status: 200,
+          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+        })
+      } catch (aggErr) {
+        console.error('[proxy-oauth-pool] SSE aggregation failed:', aggErr)
+        // 聚合失败回退透传
+      }
+    }
+    logOAuthRequest(c, provider, model, subPath, forwardBody, response.status)
+    const onLine = (line: string) => {
+      if (uid && model && isWorkbuddyProvider(provider) && line.startsWith('data:') && line.includes('"usage"') && line.includes('"credit"')) {
+        try {
+          const chunkData = line.slice(5).trim()
+          if (chunkData && chunkData !== '[DONE]') {
+            const obj = JSON.parse(chunkData)
+            if (obj.usage && typeof obj.usage.credit === 'number') {
+              const pt = typeof obj.usage.prompt_tokens === 'number' ? obj.usage.prompt_tokens : 0
+              const ct = typeof obj.usage.completion_tokens === 'number' ? obj.usage.completion_tokens : 0
+              const total = pt + ct
+              recordOauthModelCost(provider.id, uid, model, obj.usage.credit, total > 0 ? total : 1)
+            }
+          }
+        } catch { /* ignore parse error */ }
+      }
+    }
+    // 有状态清洗器（每请求新实例）：跨帧维护首帧 id 续传、tool_calls name 回填、
+    // 以及推理空转死循环与超预算熔断防护（防 50 万字符刷屏失控）。
+    // onLine 在 cleanFn **之前**执行（见 passthroughResponse 的读取循环），故成本记账
+    // 读到的始终是上游**原始**帧，usage.credit 不会被重建逻辑影响。
+    const stopSignal = { aborted: false }
+    const envMaxReasoning = c.env.WORKBUDDY_MAX_REASONING_CHARS !== undefined && c.env.WORKBUDDY_MAX_REASONING_CHARS.trim() !== ''
+      ? Number(c.env.WORKBUDDY_MAX_REASONING_CHARS)
+      : undefined
+    const cleaner = createWorkbuddyChunkCleaner({
+      stopSignal,
+      maxReasoningChars: envMaxReasoning,
+      // 上游 error 帧透传时的脱敏钩子：语义原样（code/msg/requestId 可见），
+      // 文本经 sanitizeUpstreamError 截断与脱敏（本仓脱敏红线）。
+      sanitizeErrorText: sanitizeUpstreamError,
+      onRunaway: (kind) => {
+        console.warn(`[proxy-oauth] WorkBuddy 流式防护触发: ${kind}, provider=${provider.id}, model=${model}`)
+      },
+    })
+    return passthroughResponse(
+      response,
+      cleaner,
+      onLine,
+      stopSignal,
+      workbuddyEmptyStreamGuard(cleaner, shouldGuardWorkbuddyEmptyStream(response, originalStream), provider.id, model)
+    )
+  } catch (err) {
+    // 内容拦截是**本请求的终态**：回 400 + 防火墙文案（不回 503，也不暴露账号/错误码）。
+    if (err instanceof ContentBlockedError) {
+      logOAuthRequest(c, provider, model, subPath, forwardBody, 400)
+      return c.json({
+        error: { message: err.clientMessage, type: 'content_blocked' },
+      }, 400)
+    }
+    // 客户端参数/格式错误是**本请求的终态**：透传 4xx + 上游具体原因（不轮转，避免误报 503 无可用账号）
+    if (err instanceof WorkbuddyClientError) {
+      logOAuthRequest(c, provider, model, subPath, forwardBody, err.status)
+      const formatted = formatWorkbuddyClientErrorMessage(err.status, err.upstreamText, err.kind)
+      const errorObj: Record<string, unknown> = {
+        message: formatted.message,
+        // 11115 用独立 type（对齐源 writeOpenAIError(400, "prompt_too_long", ...)），
+        // 客户端可据此区分「上下文超限」与普通参数错；11135 图片无效同理（移植 c5cdb46
+        // 的 image_invalid 出口）。
+        type: err.kind === 'prompt_too_long'
+          ? 'prompt_too_long'
+          : err.kind === 'image_invalid' ? 'image_invalid' : 'invalid_request_error',
+      }
+      if (formatted.code !== undefined) errorObj.code = formatted.code
+      // 图片无效附定向 hint（对齐源 writeOpenAIErrorHint 的 image_invalid 形态）。
+      // 与 error.message 并列，不替换/不包装 message。
+      if (err.kind === 'image_invalid') errorObj.gateway_hint = WORKBUDDY_HINT_INVALID_IMAGE
+      return c.json({ error: errorObj }, err.status as any)
+    }
+    logOAuthRequest(c, provider, model, subPath, forwardBody, 503)
+    return c.json({
+      error: { message: `OAuth 账号池无可用账号：${(err as Error).message || '未知错误'}`, type: 'no_healthy_account' },
+    }, 503)
+  }
+}
+
+async function proxyOAuthRequest(
+  c: Context<AppEnv>,
+  provider: import('./types').Provider,
+  subPath: string,
+  search: string,
+  forwardBody: object,
+  method: string = c.req.method
+): Promise<Response> {
+  const cfg = provider.oauth!
+
+  // WorkBuddy 多账号池：browser 登录流提供商走池化转发（挑号 + 冷却/禁用 + 轮转）
+  if (isOAuthPoolProvider(provider)) {
+    return proxyOAuthRequestPooled(c, provider, subPath, search, forwardBody, method)
+  }
+
+  const model = (forwardBody as Record<string, unknown>).model as string
+
+  // 会话头族（workbuddy2api issue #35）：非池化 OAuth 路径同样注入。
+  // body 改写前取 turnKey（本函数不改写 forwardBody，但保持与池化路径同一时序约定）。
+  const chatMeta: ChatMeta | undefined = isWorkbuddyProvider(provider) && subPath === 'chat/completions'
+    ? await buildChatMeta({
+        body: forwardBody as Record<string, unknown>,
+        sessionKey: extractSessionKey(forwardBody as Record<string, unknown>),
+        inboundConversationRequestId: c.req.header('X-Conversation-Request-ID') || undefined,
+        inboundTraceId: c.req.header('X-Trace-ID') || undefined,
+      })
+    : undefined
+
+  // 先从 KV 读取 token 状态（含 cookies）
+  let tokenState = await readOauthToken(c.env, provider.id)
+
+  // 域路由：根据 token 的 JWT iss 决定走 CN (copilot.tencent.com) 还是 Global (www.workbuddy.ai)。
+  const resolveRealm = (token: string): 'cn' | 'global' => {
+    return detectTokenRealm(token) === 'global' ? 'global' : 'cn'
+  }
+  const buildForwardUrl = (realm: 'cn' | 'global') => {
+    const realmBase = (realm === 'global' && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
+    return `${realmBase}/${subPath}${search}`
+  }
+  const buildOrigin = (realm: 'cn' | 'global') => {
+    return realm === 'global' && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
+  }
+  // 备用域（401 自动切换用）：CN token 不尝试 Global 域
+  const altRealm = (realm: 'cn' | 'global'): 'cn' | 'global' | null => {
+    if (realm === 'cn') return null  // CN token 在 Global 域必然 401，不浪费请求
+    if (realm === 'global') return 'cn'
+    return null
+  }
+
+  const doFetch = (token: string, realm?: 'cn' | 'global', systemOverride?: string) => {
+    const r = realm || resolveRealm(token)
+    const body = { ...forwardBody } as Record<string, unknown>
+    // WorkBuddy 只支持流式请求，强制 stream: true（所有以 workbuddy 开头的 provider ID）
+    const originalStream = body.stream
+    // WorkBuddy 上游改写三件套：developer→system / 删 reasoning_effort / 空 content + tool_choice 归一化
+    //（对齐 workbuddy-wild PrepareBody 关键不变量；仅 workbuddy 提供商，避免影响其他 oauth 提供商）
+    if (isWorkbuddyProvider(provider)) {
+      // reasoning_effort 降级（移植 workbuddy2api）：sanitize 删除前先捕获，
+      // 运营者声明了 oauth.effortPolicy 能力表则按能力降级/透传，未声明保持删除（既有行为）
+      const capturedEffort = captureWorkbuddyReasoningEffort(body)
+      if (body.stream !== true) {
+        body.stream = true
+      }
+      // stream_options 补 include_usage（移植 workbuddy2api D7），同池化路径
+      ensureWorkbuddyStreamOptions(body)
+      ensureWorkbuddyMaxTokens(body)
+      sanitizeUpstreamBody(body)
+      sanitizeBlockedTemplates(body)
+      normalizeOpenAIToolChoice(body)
+      // image_url 形状归一（字符串 → {url}）：上游只认 OpenAI 对象形态（移植 c5cdb46）
+      normalizeWorkbuddyImageURL(body)
+      if (capturedEffort) {
+        const m = typeof body['model'] === 'string' ? body['model'] : ''
+        applyWorkbuddyReasoningEffort(body, capturedEffort, resolveWorkbuddyEfforts(cfg, provider.id, m))
+      }
+      // DeepSeek 思维链注入与历史消息一致性回填
+      injectDeepSeekThinking(body)
+      backfillReasoningContent(body)
+      // global 兜底 system 注入（对齐 workbuddy2api ensureConsoleSystem / PR #45）：
+      // 非池化单账号路径此前缺失——global 账号首条非 system 时上游会 400
+      // code 11128「first message is not system prompt」。仅 global 且 chat 路径
+      //（与池化路径 1872 行同一时序：per-request realm 已确定）。
+      if (r === 'global' && subPath === 'chat/completions') {
+        ensureGlobalFallbackSystem(body)
+      }
+      // 系统提示词体系（移植 workbuddy2api internal/prompt），同池化路径时序：
+      // custom 替换 / append 追加 / 降级期一律退化为 replace（见池化路径注释）。
+      if (systemOverride) {
+        rewriteWorkbuddySystemPrompt(body, systemOverride)
+      } else if (provider.promptMode === 'custom' && provider.promptText) {
+        rewriteWorkbuddySystemPrompt(body, provider.promptText)
+      } else if (provider.promptMode === 'append' && provider.promptText) {
+        appendWorkbuddySystemPrompt(body, provider.promptText)
+      }
+    }
+    const headers = buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies: tokenState?.cookies })
+    if (isWorkbuddyProvider(provider)) {
+      injectWorkbuddyChatHeaders(headers, token, r, tokenState ? { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token } : undefined, cfg, { chatPath: subPath === 'chat/completions', chatMeta })
+    }
+    return fetchUpstream(c.env, buildForwardUrl(r), {
+      method,
+      headers,
+      body: method === 'GET' || method === 'HEAD' ? undefined : JSON.stringify(body),
+    }, (body as Record<string, unknown>).stream === true || isWorkbuddyProvider(provider)).then(resp => ({ resp, originalStream }))
+  }
+
+  // 瞬时错误自动重试：对同一 token 的瞬时 5xx / 网络抖动 / WAF 403 原地重发，
+  // 消除"偶发 500，客户端重试一次又正常"的体验问题（复用 doFetch 的流式/非流式语义）。
+  // 非池化路径没有账号可罚，故纯粹是省一次失败往返。
+  const doFetchWithRetry = async (token: string, realm?: 'cn' | 'global', systemOverride?: string) => {
+    let result = await doFetch(token, realm, systemOverride)
+    let transientRetries = 0
+    while (transientRetries < OAUTH_TRANSIENT_RETRY_MAX && await isRetryableUpstreamResponse(result.resp)) {
+      transientRetries++
+      try { c.executionCtx.waitUntil(writeLog(c.env, 'warn', `[${provider.name}] ${model} → 瞬时 ${result.resp.status}，${transientRetries}/${OAUTH_TRANSIENT_RETRY_MAX} 次重试`)) } catch {}
+      await new Promise((r) => setTimeout(r, TRANSIENT_RETRY_DELAY_MS * transientRetries))
+      try { await result.resp.body?.cancel() } catch { /* 已消费/已取消：忽略 */ }
+      result = await doFetch(token, realm, systemOverride)
+    }
+    return result
+  }
+
+  try {
+    let token = tokenState?.access_token ?? null
+    if (!token) {
+      // 尝试用 refresh_token 刷新一次
+      const refreshed = await refreshOauthToken(c.env, provider.id, cfg)
+      if (refreshed) {
+        const freshState = await readOauthToken(c.env, provider.id)
+        if (freshState) {
+          tokenState = freshState
+          token = freshState.access_token ?? null
+        }
+      }
+    }
+    if (!token) {
+      logOAuthRequest(c, provider, model, subPath, forwardBody, 502)
+      return c.json({
+        error: { message: 'OAuth 未连接或 Token 已失效，请在管理后台重新授权', type: 'oauth_not_connected' },
+      }, 502)
+    }
+
+    const primaryRealm = resolveRealm(token)
+    let { resp: response, originalStream } = await doFetchWithRetry(token)
+
+    // 401/403：可能 token 过期，刷新后重试一次
+    if ((response.status === 401 || response.status === 403) && tokenState?.refresh_token) {
+      const refreshed = await refreshOauthToken(c.env, provider.id, cfg)
+      if (refreshed) {
+        const freshState = await readOauthToken(c.env, provider.id)
+        if (freshState) {
+          tokenState = freshState
+          const retry = await doFetchWithRetry(freshState.access_token)
+          response = retry.resp
+          originalStream = retry.originalStream
+        }
+      }
+    }
+
+    // 刷新后仍 401：自动切换域重试（Global ↔ CN）
+    if (response.status === 401) {
+      const alt = altRealm(primaryRealm)
+      if (alt) {
+        console.log(`[proxy-oauth] ${primaryRealm} 域 401，自动切换到 ${alt} 域重试`)
+        const altResult = await doFetchWithRetry(token, alt)
+        if (altResult.resp.ok || altResult.resp.status !== 401) {
+          response = altResult.resp
+          originalStream = altResult.originalStream
+        }
+      }
+    }
+
+    // 系统提示词降级自愈（非池化路径，passthrough/append 共用同一 gate）：content_blocked
+    // 很可能是 system 指纹误报，换 WORKBUDDY_DEGRADED_PROMPT 中性提示词同请求重试一次
+    // （custom 模式已整体替换、不再降级；append 降级期退化为 replace，对齐源 9288f55）。
+    if (!response.ok && provider.promptMode !== 'custom') {
+      const blockText = await response.text().catch(() => '')
+      if (classifyWorkbuddyUpstreamError(response.status, blockText) === 'content_blocked') {
+        const degraded = await doFetchWithRetry(token, undefined, WORKBUDDY_DEGRADED_PROMPT)
+        if (degraded.resp.ok) {
+          response = degraded.resp
+          originalStream = degraded.originalStream
+        } else {
+          // 降级重试仍被拦 → 用户内容本身触发审核，回内容墙
+          const err = new ContentBlockedError(blockText)
+          logOAuthRequest(c, provider, model, subPath, forwardBody, 400)
+          return c.json({ error: { message: err.clientMessage, type: 'content_blocked' } }, 400)
+        }
+      }
+    }
+
+    // WorkBuddy 非流式请求：收集 SSE 流并聚合成非流式 chat.completion 返回
+    // 注意：WorkBuddy 上游 API 不直接支持非流式请求，必须发流式请求再聚合。
+    // 所有以 workbuddy 开头的 provider ID 均需此处理（workbuddy, workbuddy2 等）。
+    if (response.ok && originalStream !== true && isWorkbuddyProvider(provider) && response.body) {
+      try {
+        const aggregated = await aggregateWorkbuddySSE(
+          response.body,
+          (forwardBody as Record<string, unknown>).model as string,
+          sanitizeUpstreamError,
+        )
+        if (!aggregated.ok) {
+          // 上游在流内报错：按错误返回，不产出 200 + 空内容（对齐池化路径口径）
+          const errResp = workbuddyStreamErrorResponse(aggregated.error)
+          logOAuthRequest(c, provider, model, subPath, forwardBody, errResp.status)
+          return errResp
+        }
+        logOAuthRequest(c, provider, model, subPath, forwardBody, 200)
+        return new Response(aggregated.body, {
+          status: 200,
+          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+        })
+      } catch (aggErr) {
+        console.error('[proxy-oauth] SSE aggregation failed:', aggErr)
+        // 聚合失败，回退到透传（客户端可能能处理）
+      }
+    }
+
+    logOAuthRequest(c, provider, model, subPath, forwardBody, response.status)
+    const stopSignal = { aborted: false }
+    const envMaxReasoning = c.env.WORKBUDDY_MAX_REASONING_CHARS !== undefined && c.env.WORKBUDDY_MAX_REASONING_CHARS.trim() !== ''
+      ? Number(c.env.WORKBUDDY_MAX_REASONING_CHARS)
+      : undefined
+    const cleaner = createWorkbuddyChunkCleaner({
+      stopSignal,
+      maxReasoningChars: envMaxReasoning,
+      // 同池化路径：error 帧语义透传 + 网关脱敏
+      sanitizeErrorText: sanitizeUpstreamError,
+      onRunaway: (kind) => {
+        console.warn(`[proxy-oauth] WorkBuddy 流式防护触发: ${kind}, provider=${provider.id}, model=${model}`)
+      },
+    })
+    return passthroughResponse(
+      response,
+      cleaner,
+      undefined,
+      stopSignal,
+      workbuddyEmptyStreamGuard(cleaner, shouldGuardWorkbuddyEmptyStream(response, originalStream), provider.id, model)
+    )
+  } catch (err) {
+    const error = err as Error
+    logOAuthRequest(c, provider, model, subPath, forwardBody, 502)
+    return c.json({
+      error: { message: `OAuth 转发失败: ${error.message || '未知错误'}`, type: 'proxy_error' },
+    }, 502)
+  }
+}
+
+/** 积分倍率展示前缀（对齐 workbuddy2api fmtCreditsPrefix）："x0.05 credits"/"x0.29" → "[x0.05 credit]"。 */
+function fmtWorkbuddyCreditsPrefix(raw: string): string {
+  const s = raw.trim().replace(/\s*credits$/i, '').trim()
+  return s !== '' ? `[${s} credit]` : ''
+}
+
+/** 模型元数据缓存：`${providerId}:${realm}` → modelId → { credits, descriptionZh, supportedEfforts, defaultEffort }；null = 无可用元数据。 */
+const wbModelMetaCache = new Map<string, { meta: Map<string, WorkbuddyModelMeta> | null; at: number; ok: boolean }>()
+const WB_MODEL_META_TTL_MS = 60 * 60 * 1000
+const WB_MODEL_META_FAIL_MS = 5 * 60 * 1000
+
+/**
+ * 解析某模型可用的 reasoning 档位（P2-1：探测结果自动填充 effort 能力桶）。
+ *
+ * 优先级：**运营者手填 `oauth.effortPolicy` 优先**（显式配置是权威意图），
+ * 缺失时回落到探测缓存的 `supportedEfforts`（`/v3/config` 或企业端点声明的档位）。
+ *
+ * 为什么读缓存而非现场探测：转发路径是热路径，每次请求都打一次模型目录端点会
+ * 放大上游风控与延迟。缓存由 `/v1/models` 与管理后台「获取模型」填充；缓存未命中时
+ * 返回 undefined，`applyWorkbuddyReasoningEffort` 即保持"删除该字段"的既有行为（零回归）。
+ *
+ * 跨平台注意：`getCachedWorkbuddyEfforts` 是纯内存读取（模块级 Map，非 KV）——它只用于
+ * "本 isolate 恰好探测过"这一加速场景，读不到就退回既有行为，故多 isolate 下语义安全。
+ */
+function resolveWorkbuddyEfforts(
+  cfg: import('./types').OAuthDeviceConfig,
+  providerId: string,
+  model: string,
+): string[] | undefined {
+  if (!model) return undefined
+  const declared = cfg.effortPolicy?.[model]
+  if (declared && declared.length > 0) return declared
+  const realm: 'cn' | 'global' = 'cn'
+  return getCachedWorkbuddyEfforts(providerId, realm, model)
+    ?? getCachedWorkbuddyEfforts(providerId, 'global', model)
+    ?? undefined
+}
+
+/** /v1/models 展示用 + effort 降级用的单模型元数据。 */interface WorkbuddyModelMeta {
+  credits: string
+  descriptionZh: string
+  /** 探测到的 reasoning 档位（P2-1：自动填充 effort 能力桶，减少运营者手填 effortPolicy） */
+  supportedEfforts?: string[]
+  defaultEffort?: string
+}
+
+/**
+ * 探测 workbuddy 模型目录的元数据（CN/global 对称），供 `/v1/models` live-join 展示
+ * **并**自动填充 reasoning effort 能力桶。
+ *
+ * 已改为复用 owner `workbuddy-models.ts` 的同一探测（主路 `/v3/config` + 企业端点补缺）：
+ * 此前 admin 侧与 proxy 侧各写一套探测，口径已分叉（admin 探企业端点、proxy 只探企业端点
+ * 且不带 nonChat 过滤）。现在两侧共用同一份缓存与合并逻辑。
+ *
+ * 无 token / 探测全失败 → null（调用方零开销跳过）。
+ */
+async function getWorkbuddyModelMeta(env: Env, provider: import('./types').Provider): Promise<Map<string, WorkbuddyModelMeta> | null> {
+  if (!isWorkbuddyProvider(provider) || !provider.oauth) return null
+  const cfg = provider.oauth
+  let token: string | null = null
+  try { token = await getOauthAccessToken(env, provider.id, cfg) } catch { token = null }
+  if (!token) return null
+  const realm: 'cn' | 'global' = detectTokenRealm(token) === 'global' ? 'global' : 'cn'
+  const cacheKey = `${provider.id}:${realm}`
+  const now = Date.now()
+  const cached = wbModelMetaCache.get(cacheKey)
+  if (cached) {
+    const freshWindow = cached.ok ? WB_MODEL_META_TTL_MS : WB_MODEL_META_FAIL_MS
+    if (now - cached.at < freshWindow) return cached.meta
+  }
+  const tokenState = await readOauthToken(env, provider.id).catch(() => null)
+  const probe = await probeWorkbuddyModelCatalog(env, provider, realm, token, tokenState?.cookies)
+  if (probe.stale) {
+    // 动态全失败 → 不产出元数据（避免用静态兜底编造 credits/档位）
+    wbModelMetaCache.set(cacheKey, { meta: null, at: now, ok: false })
+    return null
+  }
+  const meta = new Map<string, WorkbuddyModelMeta>()
+  for (const e of probe.entries) {
+    if (!e.credits && !e.descriptionZh && !e.supportedEfforts?.length && !e.defaultEffort) continue
+    meta.set(e.id, {
+      credits: e.credits || '',
+      descriptionZh: e.descriptionZh || '',
+      ...(e.supportedEfforts?.length ? { supportedEfforts: e.supportedEfforts } : {}),
+      ...(e.defaultEffort ? { defaultEffort: e.defaultEffort } : {}),
+    })
+  }
+  wbModelMetaCache.set(cacheKey, { meta: meta.size > 0 ? meta : null, at: now, ok: true })
+  return meta.size > 0 ? meta : null
+}
+
+/** 处理 /v1/models — 返回所有已启用的模型（含提供商前缀）。
+ * 全量列表在内存中缓存（TTL 同 providers，可经管理后台「内存缓存」查看/清空），
+ * 之后按转发 Key 的 allowedModels 逐请求过滤；并回写 Cache-Control 让客户端/CDN 缓存。 */
+export async function handleModels(c: Context<AppEnv>) {
+  const cached = getModelsListCache()
+  let models: Array<{
+    id: string
+    provider: string
+    provider_name: string
+    object: string
+    created: number
+    owned_by: string
+    /** workbuddy global 积分倍率展示（live-join，可选） */
+    description?: string
+    credits?: string
+  }> = cached ? JSON.parse(cached) : []
+
+  if (!cached) {
+    const providers = await getProviders(c.env)
+    const nowTs = Math.floor(Date.now() / 1000)
+    for (const provider of providers) {
+      if (!provider.enabled) continue
+      // workbuddy 提供商：live-join 上游模型目录的积分倍率/描述（非 workbuddy → null 零开销）。
+      const wbMeta = isWorkbuddyProvider(provider) ? await getWorkbuddyModelMeta(c.env, provider) : null
+      for (const model of provider.models) {
+        if (!model.enabled) continue
+        const fullId = `${provider.id}/${model.id}`
+        const entry: {
+          id: string
+          provider: string
+          provider_name: string
+          object: string
+          created: number
+          owned_by: string
+          description?: string
+          credits?: string
+        } = {
+          id: fullId,
+          provider: provider.id,
+          provider_name: provider.name,
+          object: 'model',
+          created: nowTs,
+          owned_by: provider.id,
+        }
+        const meta = wbMeta?.get(model.id)
+        if (meta && (meta.credits || meta.descriptionZh)) {
+          const prefix = fmtWorkbuddyCreditsPrefix(meta.credits)
+          entry.description = `${prefix} ${meta.descriptionZh}`.trim()
+          if (meta.credits) entry.credits = meta.credits
+        }
+        models.push(entry)
+      }
+    }
+
+    setModelsListCache(JSON.stringify(models))
+  }
+
+  // 从中间件获取转发 Key（可能带有 allowedModels 过滤）—— 过滤在缓存之后，保证各 Key 命中同一份全量列表
+  const proxyKey = (c as any).get('proxyKey') as import('./types').ProxyKey | undefined
+  const allowed = proxyKey?.allowedModels
+  const allowSet = allowed && allowed.length > 0 ? new Set(allowed) : null
+  const filtered = allowSet ? models.filter((m) => allowSet.has(m.id)) : models
+
+  c.header('Cache-Control', 'public, max-age=10')
+  return c.json({
+    object: 'list',
+    data: filtered,
+  })
+}
+
+// ============================================================
+//  Anthropic Messages API 代理  /v1/messages
+//  将 Anthropic 格式请求转为 OpenAI Chat Completions，
+//  调用 WorkBuddy 上游，再将响应转回 Anthropic 格式。
+// ============================================================
+
+export async function handleAnthropicMessages(c: Context<AppEnv>) {
+  const proxyKey = c.get('proxyKey') || null
+  const proxyKeyHash = c.get('proxyKeyHash') || ''
+  let context = createAnalyticsContext(c, proxyKey, proxyKeyHash, 'messages', '', 'sync')
+  try {
+    const response = await handleAnthropicMessagesInner(c)
+    const req = c.get('analyticsRequest')
+    if (req) {
+      context = createAnalyticsContext(c, proxyKey, proxyKeyHash, req.route, req.model, req.streamMode)
+    }
+    return finalizeProxyResponse(c, response, applyUpstreamAttribution(c, context), 'messages', 'anthropic')
+  } catch (err) {
+    writeAnalyticsEvent(c, {
+      context: applyUpstreamAttribution(c, context),
+      result: 'failure',
+      errorSummary: summarizeError(err instanceof Error ? err.message : String(err)),
+    })
+    throw err
+  }
+}
+
+/**
+ * /v1/messages 实际处理逻辑（内层）。
+ *
+ * 拆成内外两层的原因：本函数有多处提前 return（模型缺失/提供商不存在/模型未配置），
+ * 若在每处都补写 analytics 会漏项且易腐化。外层包装统一在**唯一出口**补记用量，
+ * 与 handleProxy 的 finalizeProxyResponse 走同一条记录路径。
+ */
+async function handleAnthropicMessagesInner(c: Context<AppEnv>) {
+  try {
+    const anthropicBody = await readBoundedJSON<Record<string, unknown>>(c)
+    const model = anthropicBody['model'] as string
+
+    if (!model) {
+      return c.json({ type: 'error', error: { type: 'invalid_request_error', message: 'Missing model' } }, 400)
+    }
+
+    // 供外层包装补记 analytics（body 已被本函数消费，外层无法再解析）
+    c.set('analyticsRequest', {
+      route: 'messages',
+      model,
+      streamMode: anthropicBody['stream'] === true ? 'stream' : 'sync',
+    })
+
+    // 解析 providerId/modelId 格式
+    const parsed = parseModelId(model)
+    if (!parsed) {
+      return c.json({
+        type: 'error',
+        error: { type: 'invalid_request_error', message: `Invalid model format "${model}", use providerId/modelId` },
+      }, 400)
+    }
+
+    const { providerId, modelId } = parsed
+
+    // 权限检查
+    const proxyKey = (c as any).get('proxyKey') as import('./types').ProxyKey | undefined
+    if (proxyKey?.allowedModels && proxyKey.allowedModels.length > 0) {
+      if (!proxyKey.allowedModels.includes(model)) {
+        return c.json({
+          type: 'error',
+          error: { type: 'permission_error', message: `Model "${model}" not allowed for this key` },
+        }, 403)
+      }
+    }
+
+    const provider = await getProvider(c.env, providerId)
+    if (!provider) {
+      return c.json({
+        type: 'error',
+        error: { type: 'invalid_request_error', message: `Provider "${providerId}" not found` },
+      }, 404)
+    }
+    if (!provider.enabled) {
+      return c.json({
+        type: 'error',
+        error: { type: 'provider_disabled', message: `Provider "${provider.name}" is disabled` },
+      }, 403)
+    }
+
+    const modelConfig = provider.models.find((m) => m.id === modelId)
+    if (!modelConfig) {
+      return c.json({
+        type: 'error',
+        error: { type: 'invalid_request_error', message: `Model "${modelId}" not configured` },
+      }, 404)
+    }
+
+    // 本入口不走 forwardProxy，需自行登记 analytics 归属（同 forwardProxy 内的处理）
+    c.set('analyticsUpstream', {
+      providerId: provider.id,
+      providerName: provider.name,
+      providerType: provider.apiType || 'openai',
+      upstreamModel: modelId,
+    })
+
+    // Anthropic → OpenAI 转换
+    const anthropicReq = anthropicBody as any
+    const openaiBody = anthropicToOpenAI(anthropicReq)
+    // 替换为上游模型 ID
+    openaiBody['model'] = modelId
+    // 缓存前缀注入：提供商勾选该模型时，在 messages 头部注入固定缓存前缀（提升前缀缓存命中率）
+    await applyCachePrefixInjection(c.env, provider, modelId, openaiBody)
+    // 思维模式引导注入：提供商勾选该模型时，在 messages 头部注入思维引导 system 提示词
+    await applyThinkingInjection(c.env, provider, modelId, openaiBody)
+
+    const originalStream = anthropicReq.stream === true
+
+    // OAuth 提供商走 OAuth 代理路径
+    if (provider.authType === 'oauth-device' && provider.oauth) {
+      const cfg = provider.oauth
+      // 强制流式（WorkBuddy 只支持流式）
+      const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
+      // 会话头族（workbuddy2api issue #35）：body 改写前取 turnKey，整个请求复用同一聚合主键。
+      const wbChatMeta: ChatMeta | undefined = isWorkbuddyProvider(provider)
+        ? await buildChatMeta({
+            body: openaiBody as Record<string, unknown>,
+            sessionKey: extractSessionKey(openaiBody as Record<string, unknown>),
+            inboundConversationRequestId: c.req.header('X-Conversation-Request-ID') || undefined,
+            inboundTraceId: c.req.header('X-Trace-ID') || undefined,
+          })
+        : undefined
+      // WorkBuddy reasoning_effort 捕获（sanitize 删除前抢救，仅 workbuddy 提供商恢复/降级）
+      const wbCapturedEffort = isWorkbuddyProvider(provider) ? captureWorkbuddyReasoningEffort(upstreamBody) : null
+      // 清理上游不支持的字段 + 被屏蔽的 Claude Code 模板短语
+      sanitizeUpstreamBody(upstreamBody)
+      sanitizeBlockedTemplates(upstreamBody)
+      // max_completion_tokens → max_tokens（部分上游只认 max_tokens）
+      if (upstreamBody['max_completion_tokens'] !== undefined && upstreamBody['max_tokens'] === undefined) {
+        upstreamBody['max_tokens'] = upstreamBody['max_completion_tokens']
+        delete upstreamBody['max_completion_tokens']
+      }
+      // 清理被 CodeBuddy 内容过滤器屏蔽的 Claude Code 模板短语
+      sanitizeBlockedTemplates(upstreamBody)
+      // tool_choice 归一化：对象形式（如 Anthropic 转换后的 {type:function,function:{name}}）
+      // 会被 WorkBuddy 上游以 400 code=11101 拒绝，需转字符串（对齐 workbuddy-wild PrepareBody 不变量）
+      if (isWorkbuddyProvider(provider)) {
+        // stream_options 补 include_usage（移植 workbuddy2api D7）：上游据此在末帧回 usage，
+        // 成本账本（recordOauthModelCost）依赖它；未带才注入，显式带则尊重调用方
+        ensureWorkbuddyStreamOptions(upstreamBody)
+        ensureWorkbuddyMaxTokens(upstreamBody)
+        normalizeOpenAIToolChoice(upstreamBody)
+        // image_url 形状归一（字符串 → {url}）：上游只认 OpenAI 对象形态（移植 c5cdb46）
+        normalizeWorkbuddyImageURL(upstreamBody)
+        // reasoning_effort 降级（移植 workbuddy2api）：运营者声明 oauth.effortPolicy 才恢复/降级，未声明保持删除
+        if (wbCapturedEffort) {
+          const m = typeof upstreamBody['model'] === 'string' ? upstreamBody['model'] : ''
+          applyWorkbuddyReasoningEffort(upstreamBody, wbCapturedEffort, resolveWorkbuddyEfforts(cfg, provider.id, m))
+        }
+        // DeepSeek 思维链注入与历史消息一致性回填
+        injectDeepSeekThinking(upstreamBody)
+        backfillReasoningContent(upstreamBody)
+      }
+
+      // WorkBuddy 多账号池：browser 登录流提供商走池化转发（挑号 + 冷却/禁用 + 轮转）
+      let response: Response
+      let upstreamUrl = `${provider.baseUrl.replace(/\/$/, '')}/chat/completions`
+      if (isOAuthPoolProvider(provider)) {
+        try {
+          const core = await proxyOAuthRequestPooledCore(c, provider, 'chat/completions', '', upstreamBody, 'POST')
+          response = core.response
+        } catch (e) {
+          // 内容拦截终态：回 400（Anthropic 错误形状）+ 防火墙文案
+          if (e instanceof ContentBlockedError) {
+            return c.json({
+              type: 'error',
+              error: { type: 'content_blocked', message: e.clientMessage },
+            }, 400)
+          }
+          // 客户端参数/格式错误终态：回 4xx（Anthropic 错误形状）+ 上游原因（不轮转，避免误报 503 无可用账号）
+          if (e instanceof WorkbuddyClientError) {
+            const formatted = formatWorkbuddyClientErrorMessage(e.status, e.upstreamText, e.kind)
+            const errorObj: Record<string, unknown> = {
+              type: e.kind === 'prompt_too_long'
+                ? 'prompt_too_long'
+                : e.kind === 'image_invalid' ? 'image_invalid' : 'invalid_request_error',
+              message: formatted.message,
+            }
+            if (e.kind === 'image_invalid') errorObj.gateway_hint = WORKBUDDY_HINT_INVALID_IMAGE
+            return c.json({
+              type: 'error',
+              error: errorObj,
+            }, e.status as any)
+          }
+          return c.json({
+            type: 'error',
+            error: { type: 'no_healthy_account', message: 'OAuth 账号池无可用账号：' + ((e as Error).message || '') },
+          }, 503)
+        }
+      } else {
+        // 读取 token 状态
+        let tokenState = await readOauthToken(c.env, providerId)
+        if (!tokenState?.access_token) {
+          // 尝试刷新
+          const refreshed = await refreshOauthToken(c.env, providerId, cfg)
+          if (refreshed) tokenState = await readOauthToken(c.env, providerId)
+        }
+        if (!tokenState?.access_token) {
+          return c.json({
+            type: 'error',
+            error: { type: 'authentication_error', message: 'OAuth token not available. Please login first.' },
+          }, 401)
+        }
+
+        // 域路由：根据 JWT iss 判断 CN vs Global
+        const realm = detectTokenRealm(tokenState.access_token)
+        const isGlobal = realm === 'global'
+        const realmBase = (isGlobal && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
+        const origin = isGlobal && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
+        upstreamUrl = `${realmBase}/chat/completions`
+
+        // Global 域需要兜底 system message
+        if (isGlobal) {
+          // global 兜底 system 注入（对齐 workbuddy2api ensureConsoleSystem：**首条**非 system 才注入）
+          ensureGlobalFallbackSystem(upstreamBody)
+        }
+
+        const headers = buildOauthHeaders(cfg, tokenState.access_token, {
+          origin,
+          cookies: tokenState.cookies,
+        })
+        if (isWorkbuddyProvider(provider)) {
+          injectWorkbuddyChatHeaders(headers, tokenState.access_token, isGlobal ? 'global' : 'cn', { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token }, cfg, { chatPath: true, chatMeta: wbChatMeta })
+        }
+
+        response = await fetchUpstream(c.env, upstreamUrl, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(upstreamBody),
+        }, originalStream === true)
+
+        // 401/403 时刷新 token 重试
+        if ((response.status === 401 || response.status === 403) && tokenState.refresh_token) {
+          const refreshed = await refreshOauthToken(c.env, providerId, cfg)
+          if (refreshed) {
+            const freshState = await readOauthToken(c.env, providerId)
+            if (freshState?.access_token) {
+              const retryHeaders = buildOauthHeaders(cfg, freshState.access_token, {
+                origin,
+                cookies: freshState.cookies,
+              })
+              if (isWorkbuddyProvider(provider)) {
+                injectWorkbuddyChatHeaders(retryHeaders, freshState.access_token, isGlobal ? 'global' : 'cn', { uid: freshState.uid, enterprise_id: freshState.enterprise_id, domain: freshState.domain, device_token: freshState.device_token }, cfg, { chatPath: true, chatMeta: wbChatMeta })
+              }
+              response = await fetchUpstream(c.env, upstreamUrl, {
+                method: 'POST',
+                headers: retryHeaders,
+                body: JSON.stringify(upstreamBody),
+              }, originalStream === true)
+            }
+          }
+        }
+      }
+
+      if (!response.ok) {
+        const errText = await response.text()
+        try {
+          const bodySummary = summarizeRequestBody(upstreamBody)
+          c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → ${response.status} ${upstreamUrl}`, JSON.stringify({ error: errText, body: bodySummary, url: upstreamUrl }).substring(0, 4000)))
+        } catch { /* log failure must not break request */ }
+        return c.json({
+          type: 'error',
+          error: { type: 'upstream_error', message: `Upstream error: ${sanitizeUpstreamError(errText)}` },
+        }, response.status as Parameters<typeof c.json>[1])
+      }
+
+      try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[anthropic] ${model} → 200 ${upstreamUrl}`, `stream=${originalStream}`)) } catch {}
+
+      // 流式：OpenAI SSE → Anthropic SSE 实时转换
+      if (originalStream && response.body) {
+        const acc = createAnthropicSSEAccumulator()
+        const readable = new ReadableStream({
+          async start(controller) {
+            const decoder = new TextDecoderStream()
+            const textReader = response.body!.pipeThrough(decoder).getReader()
+            let lineBuffer = ''
+
+            try {
+              while (true) {
+                const { done, value } = await textReader.read()
+                if (done) break
+                const combined = lineBuffer + value
+                const lines = combined.split('\n')
+                lineBuffer = lines.pop() || ''
+
+                for (const line of lines) {
+                  const trimmed = line.trim()
+                  if (!trimmed.startsWith('data:')) continue
+                  const data = trimmed.slice(5).trim()
+                  if (!data || data === '[DONE]') continue
+
+                  try {
+                    const chunk = JSON.parse(data)
+                    // 清洗 WorkBuddy 噪音
+                    cleanChunkDelta(chunk)
+                    const anthropicSSE = openAIChunkToAnthropicSSE(chunk, acc)
+                    if (anthropicSSE) {
+                      controller.enqueue(new TextEncoder().encode(anthropicSSE))
+                    }
+                  } catch { /* skip malformed */ }
+                }
+              }
+              // 处理剩余缓冲
+              if (lineBuffer.trim().startsWith('data:')) {
+                const data = lineBuffer.trim().slice(5).trim()
+                if (data && data !== '[DONE]') {
+                  try {
+                    const chunk = JSON.parse(data)
+                    cleanChunkDelta(chunk)
+                    const anthropicSSE = openAIChunkToAnthropicSSE(chunk, acc)
+                    if (anthropicSSE) {
+                      controller.enqueue(new TextEncoder().encode(anthropicSSE))
+                    }
+                  } catch { /* skip */ }
+                }
+              }
+            } catch { /* stream error */ }
+            // 流结束兜底：补发缺失的 content_block_stop / message_stop 事件。
+            // 上游偶尔未正常发送 finish_reason，或在 tool_use 块未关闭时就结束流，
+            // 会导致客户端报 "truncated: stream ended"。此处保证流的正确结束，
+            // 并在触发兜底时记录诊断日志（含 tool_use 名称/id），便于定位问题工具调用。
+            const finalizeDiag = diagnoseAnthropicAccumulator(acc)
+            const finalized = finalizeAnthropicStream(acc)
+            if (finalized) {
+              try {
+                controller.enqueue(new TextEncoder().encode(finalized))
+              } catch { /* enqueue failed */ }
+              // 仅在确实补发了事件时记录 warn 日志（正常结束不会触发）
+              try {
+                c.executionCtx.waitUntil(writeLog(c.env, 'warn',
+                  `[anthropic] 流结束兜底触发 ${model}`,
+                  JSON.stringify({ providerId: provider.id, model, ...finalizeDiag })
+                ))
+              } catch { /* log failure must not break */ }
+            }
+            controller.close()
+          },
+        })
+
+        return new Response(withSSEKeepAlive(readable, SSE_KEEPALIVE_MS, SSE_IDLE_TIMEOUT_MS), {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-store',
+            'X-Accel-Buffering': 'no',
+          },
+        })
+      }
+
+      // 非流式：收集所有 OpenAI SSE → 聚合 → Anthropic
+      const allChunks: any[] = []
+      const decoder2 = new TextDecoderStream()
+      const textReader2 = response.body!.pipeThrough(decoder2).getReader()
+      let lineBuffer2 = ''
+
+      try {
+        while (true) {
+          const { done, value } = await textReader2.read()
+          if (done) break
+          const combined = lineBuffer2 + value
+          const lines = combined.split('\n')
+          lineBuffer2 = lines.pop() || ''
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed.startsWith('data:')) continue
+            const data = trimmed.slice(5).trim()
+            if (!data || data === '[DONE]') continue
+            try {
+              const chunk = JSON.parse(data)
+              cleanChunkDelta(chunk)
+              allChunks.push(chunk)
+            } catch { /* skip */ }
+          }
+        }
+      } catch { /* stream error */ }
+
+      const anthropicResp = aggregateOpenAIToAnthropic(allChunks)
+      return c.json(anthropicResp)
+    }
+
+    // Anthropic 原生上游（provider.apiType === 'anthropic'，如 api.anthropic.com）：
+    // 请求体/认证头/路径都转成 Anthropic 原生格式，响应原样透传（Anthropic → Anthropic，保真度最高）
+    if (provider.apiType === 'anthropic') {
+      return await proxyAnthropicNativeUpstream(c, provider, providerId, modelId, openaiBody, originalStream, 'messages')
+    }
+
+    // 非 OAuth 提供商：用 apiKey 标准转发，始终发 OpenAI 格式到上游
+    const enabledKeys = provider.apiKeys.filter(k => k.enabled)
+    if (enabledKeys.length === 0) {
+      return c.json({
+        type: 'error',
+        error: { type: 'configuration_error', message: `Provider "${provider.name}" has no enabled API keys` },
+      }, 500)
+    }
+
+    const resolvedBase = resolveProviderBaseUrl(c.env, provider.baseUrl)
+    if (!resolvedBase) {
+      return c.json({
+        type: 'error',
+        error: { type: 'configuration_error', message: `Provider "${provider.name}" baseUrl has {CF_ACCOUNT_ID} placeholder but CF_ACCOUNT_ID env is not set` },
+      }, 500)
+    }
+    const cleanBase = resolvedBase.replace(/\/$/, '')
+    const forwardUrl = `${cleanBase}/chat/completions`
+    const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
+    // 清理上游不支持的字段 + 被屏蔽的 Claude Code 模板短语
+    sanitizeUpstreamBody(upstreamBody)
+    sanitizeBlockedTemplates(upstreamBody)
+    // max_completion_tokens → max_tokens（部分上游只认 max_tokens）
+    if (upstreamBody['max_completion_tokens'] !== undefined && upstreamBody['max_tokens'] === undefined) {
+      upstreamBody['max_tokens'] = upstreamBody['max_completion_tokens']
+      delete upstreamBody['max_completion_tokens']
+    }
+    // 清理上游不支持的字段 + 被屏蔽的 Claude Code 模板短语
+    sanitizeUpstreamBody(upstreamBody)
+    sanitizeBlockedTemplates(upstreamBody)
+    // R3：多 Key 顺序 failover——单 key 故障（HTTP 非 2xx 或网络异常）自动切换
+    // 下一个启用的 key，全部失败才把最后一次错误返回给客户端。
+    let response: Response | undefined
+    let lastErrText = ''
+    let lastStatus = 502
+    for (const key of enabledKeys) {
+      try {
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${key.key}`,
+          // P7：白名单前缀头（x- / anthropic- / user-）透传，供上游识别客户端
+          ...buildPassthroughHeaders(c),
+        }
+
+        const r = await fetchUpstream(c.env, forwardUrl, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(upstreamBody),
+        }, originalStream === true)
+        if (r.ok) {
+          response = r
+          break
+        }
+        lastStatus = r.status
+        lastErrText = await r.text()
+      } catch (err) {
+        lastStatus = 502
+        lastErrText = (err as Error).message || '网络错误'
+      }
+    }
+
+    if (!response) {
+      try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → failover 全部失败 ${forwardUrl}`, JSON.stringify({ error: lastErrText, body: summarizeRequestBody(upstreamBody), url: forwardUrl }).substring(0, 4000))) } catch {}
+      return c.json({
+        type: 'error',
+        error: { type: 'upstream_error', message: `Upstream error: ${sanitizeUpstreamError(lastErrText)}` },
+      }, lastStatus as Parameters<typeof c.json>[1])
+    }
+
+    try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[anthropic] ${model} → 200 ${forwardUrl}`, `stream=${originalStream}`)) } catch {}
+
+    // 流式：OpenAI SSE → Anthropic SSE 实时转换
+    if (originalStream && response.body) {
+      const acc = createAnthropicSSEAccumulator()
+      const readable = new ReadableStream({
+        async start(controller) {
+          const decoder = new TextDecoderStream()
+          const textReader = response.body!.pipeThrough(decoder).getReader()
+          let lineBuffer = ''
+
+          try {
+            while (true) {
+              const { done, value } = await textReader.read()
+              if (done) break
+              const combined = lineBuffer + value
+              const lines = combined.split('\n')
+              lineBuffer = lines.pop() || ''
+
+              for (const line of lines) {
+                const trimmed = line.trim()
+                if (!trimmed.startsWith('data:')) continue
+                const data = trimmed.slice(5).trim()
+                if (!data || data === '[DONE]') continue
+
+                try {
+                  const chunk = JSON.parse(data)
+                  cleanChunkDelta(chunk)
+                  const anthropicSSE = openAIChunkToAnthropicSSE(chunk, acc)
+                  if (anthropicSSE) {
+                    controller.enqueue(new TextEncoder().encode(anthropicSSE))
+                  }
+                } catch { /* skip malformed */ }
+              }
+            }
+          } catch { /* stream error */ }
+          // 流结束兜底：补发缺失的 content_block_stop / message_stop 事件。
+          // 上游偶尔未正常发送 finish_reason，或在 tool_use 块未关闭时就结束流，
+          // 会导致客户端报 "truncated: stream ended"。此处保证流的正确结束，
+          // 并在触发兜底时记录诊断日志（含 tool_use 名称/id），便于定位问题工具调用。
+          const finalizeDiag = diagnoseAnthropicAccumulator(acc)
+          const finalized = finalizeAnthropicStream(acc)
+          if (finalized) {
+            try {
+              controller.enqueue(new TextEncoder().encode(finalized))
+            } catch { /* enqueue failed */ }
+            // 仅在确实补发了事件时记录 warn 日志（正常结束不会触发）
+            try {
+              c.executionCtx.waitUntil(writeLog(c.env, 'warn',
+                `[anthropic] 流结束兜底触发 ${model}`,
+                JSON.stringify({ providerId: provider.id, model, ...finalizeDiag })
+              ))
+            } catch { /* log failure must not break */ }
+          }
+          controller.close()
+        },
+      })
+
+      return new Response(readable, {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-store',
+          'X-Accel-Buffering': 'no',
+        },
+      })
+    }
+
+    // 非流式：收集所有 OpenAI SSE → 聚合 → Anthropic
+    const allChunks: any[] = []
+    const decoder = new TextDecoderStream()
+    const textReader = response.body!.pipeThrough(decoder).getReader()
+    let lineBuffer2 = ''
+
+    try {
+      while (true) {
+        const { done, value } = await textReader.read()
+        if (done) break
+        const combined = lineBuffer2 + value
+        const lines = combined.split('\n')
+        lineBuffer2 = lines.pop() || ''
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed.startsWith('data:')) continue
+          const data = trimmed.slice(5).trim()
+          if (!data || data === '[DONE]') continue
+          try {
+            const chunk = JSON.parse(data)
+            cleanChunkDelta(chunk)
+            allChunks.push(chunk)
+          } catch { /* skip */ }
+        }
+      }
+    } catch { /* stream error */ }
+
+    const anthropicResp = aggregateOpenAIToAnthropic(allChunks)
+    return c.json(anthropicResp)
+  } catch (err) {
+    console.error('[anthropic] error:', err)
+    return c.json({ type: 'error', error: { type: 'server_error', message: 'Internal server error' } }, 500)
+  }
+}
+
+// ============================================================
+//  OpenAI Responses API 代理  /v1/responses
+//  将 Responses 格式请求转为 Chat Completions，调用上游，
+//  再将响应转回 Responses 格式。
+// ============================================================
+
+export async function handleResponses(c: Context<AppEnv>) {
+  const proxyKey = c.get('proxyKey') || null
+  const proxyKeyHash = c.get('proxyKeyHash') || ''
+  let context = createAnalyticsContext(c, proxyKey, proxyKeyHash, 'responses', '', 'sync')
+  try {
+    const response = await handleResponsesInner(c)
+    const req = c.get('analyticsRequest')
+    if (req) {
+      context = createAnalyticsContext(c, proxyKey, proxyKeyHash, req.route, req.model, req.streamMode)
+    }
+    return finalizeProxyResponse(c, response, applyUpstreamAttribution(c, context), 'responses')
+  } catch (err) {
+    writeAnalyticsEvent(c, {
+      context: applyUpstreamAttribution(c, context),
+      result: 'failure',
+      errorSummary: summarizeError(err instanceof Error ? err.message : String(err)),
+    })
+    throw err
+  }
+}
+
+/** /v1/responses 实际处理逻辑（内层）；拆层原因同 handleAnthropicMessagesInner。 */
+async function handleResponsesInner(c: Context<AppEnv>) {
+  try {
+    const responsesBody = await readBoundedJSON<Record<string, unknown>>(c, MAX_RESPONSES_REQUEST_BYTES)
+    const model = responsesBody['model'] as string
+
+    if (!model) {
+      return c.json({ error: { message: 'Missing model', type: 'invalid_request_error' } }, 400)
+    }
+
+    // 供外层包装补记 analytics（body 已被本函数消费，外层无法再解析）
+    c.set('analyticsRequest', {
+      route: 'responses',
+      model,
+      streamMode: responsesBody['stream'] === true ? 'stream' : 'sync',
+    })
+
+    const parsed = parseModelId(model)
+    if (!parsed) {
+      return c.json({
+        error: { message: `Invalid model format "${model}", use providerId/modelId`, type: 'invalid_request_error' },
+      }, 400)
+    }
+
+    const { providerId, modelId } = parsed
+
+    const proxyKey = (c as any).get('proxyKey') as import('./types').ProxyKey | undefined
+    if (proxyKey?.allowedModels && proxyKey.allowedModels.length > 0) {
+      if (!proxyKey.allowedModels.includes(model)) {
+        return c.json({
+          error: { message: `Model "${model}" not allowed for this key`, type: 'permission_error' },
+        }, 403)
+      }
+    }
+
+    const provider = await getProvider(c.env, providerId)
+    if (!provider) {
+      return c.json({ error: { message: `Provider "${providerId}" not found`, type: 'invalid_request_error' } }, 404)
+    }
+    if (!provider.enabled) {
+      return c.json({ error: { message: `Provider "${provider.name}" is disabled`, type: 'provider_disabled' } }, 403)
+    }
+
+    const modelConfig = provider.models.find((m) => m.id === modelId)
+    if (!modelConfig) {
+      return c.json({ error: { message: `Model "${modelId}" not configured`, type: 'invalid_request_error' } }, 404)
+    }
+
+    // 本入口不走 forwardProxy，需自行登记 analytics 归属（同 forwardProxy 内的处理）
+    c.set('analyticsUpstream', {
+      providerId: provider.id,
+      providerName: provider.name,
+      providerType: provider.apiType || 'openai',
+      upstreamModel: modelId,
+    })
+
+    // Responses → OpenAI 转换
+    const responsesReq = responsesBody as any
+    const openaiBody = responsesToOpenAI(responsesReq)
+    openaiBody['model'] = modelId
+
+    // G5：解析 previous_response_id 指定的多轮历史（在缓存前缀/思维注入之前，避免把网关提示词写入会话历史）。
+    // g5Base = 已解析历史 + 本次输入（副本，防止随后的 unshift 注入污染会话历史）。
+    const inputMsgs = ((openaiBody['messages'] as unknown[]) || [])
+    let g5Base = [...inputMsgs]
+    const prevRespId = responsesBody['previous_response_id']
+    // 租户归属：历史/别名只允许同一调用方 API Key 读取（键可被毫秒时间戳枚举，见 §3.3）
+    const g5Tenant = c.get('proxyKeyHash') || ''
+    if (prevRespId) {
+      const prior = await getResponseHistory(c.env, String(prevRespId), g5Tenant)
+      if (prior && prior.length > 0) {
+        openaiBody['messages'] = [...prior, ...inputMsgs]
+        g5Base = [...prior, ...g5Base]
+      }
+    }
+
+    // 缓存前缀注入：提供商勾选该模型时，在 messages 头部注入固定缓存前缀（提升前缀缓存命中率）
+    await applyCachePrefixInjection(c.env, provider, modelId, openaiBody)
+    // 思维模式引导注入：提供商勾选该模型时，在 messages 头部注入思维引导 system 提示词
+    await applyThinkingInjection(c.env, provider, modelId, openaiBody)
+
+    // G5：把「已解析历史 + 本次输入 + assistant 输出」按 response.id 存入 KV
+    const g5Save = (respId: string, fullHistory: unknown[]) => {
+      try { c.executionCtx.waitUntil(saveResponseHistory(c.env, respId, fullHistory, g5Tenant)) } catch {}
+    }
+
+    const originalStream = responsesReq.stream === true
+
+    // OAuth 提供商
+    if (provider.authType === 'oauth-device' && provider.oauth) {
+      const cfg = provider.oauth
+      const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
+      // 会话头族（workbuddy2api issue #35）：在 body 改写前取 turnKey（改写会动 messages 内容），
+      // 整个请求（含 401 重试）复用同一 conversationRequestId。
+      const wbChatMeta: ChatMeta | undefined = isWorkbuddyProvider(provider)
+        ? await buildChatMeta({
+            body: openaiBody as Record<string, unknown>,
+            sessionKey: extractSessionKey(openaiBody as Record<string, unknown>),
+            inboundConversationRequestId: c.req.header('X-Conversation-Request-ID') || undefined,
+            inboundTraceId: c.req.header('X-Trace-ID') || undefined,
+          })
+        : undefined
+      // WorkBuddy reasoning_effort 捕获（sanitize 删除前抢救，与 chat/Anthropic 路径一致）
+      const wbCapturedEffort = isWorkbuddyProvider(provider) ? captureWorkbuddyReasoningEffort(upstreamBody) : null
+      // 清理上游不支持的字段（developer → system, 删除 reasoning_effort 等）
+      sanitizeUpstreamBody(upstreamBody)
+      sanitizeBlockedTemplates(upstreamBody)
+      // WorkBuddy 专属改写（补齐此前 Responses 路径缺失的整块，对齐 chat/Anthropic 路径）：
+      // 否则 Responses 入口的 WorkBuddy 请求会带着上游拒绝的字段出站。
+      if (isWorkbuddyProvider(provider)) {
+        // stream_options 补 include_usage（D7）
+        ensureWorkbuddyStreamOptions(upstreamBody)
+        ensureWorkbuddyMaxTokens(upstreamBody)
+        // tool_choice 归一（对象形式会被上游 400 code=11101 拒绝）
+        normalizeOpenAIToolChoice(upstreamBody)
+        // image_url 形状归一（字符串 → {url}）：上游只认 OpenAI 对象形态（移植 c5cdb46）
+        normalizeWorkbuddyImageURL(upstreamBody)
+        // reasoning_effort 降级（按运营者声明的 effortPolicy）
+        if (wbCapturedEffort) {
+          const m = typeof upstreamBody['model'] === 'string' ? upstreamBody['model'] : ''
+          applyWorkbuddyReasoningEffort(upstreamBody, wbCapturedEffort, resolveWorkbuddyEfforts(cfg, provider.id, m))
+        }
+        // DeepSeek 思维链注入与历史消息一致性回填
+        injectDeepSeekThinking(upstreamBody)
+        backfillReasoningContent(upstreamBody)
+      }
+
+      // 读取 token 状态
+      let tokenState = await readOauthToken(c.env, providerId)
+      if (!tokenState?.access_token) {
+        const refreshed = await refreshOauthToken(c.env, providerId, cfg)
+        if (refreshed) tokenState = await readOauthToken(c.env, providerId)
+      }
+      if (!tokenState?.access_token) {
+        return c.json({
+          error: { message: 'OAuth token not available. Please login first.', type: 'authentication_error' },
+        }, 401)
+      }
+
+      // 域路由
+      const realm = detectTokenRealm(tokenState.access_token)
+      const isGlobal = realm === 'global'
+      const realmBase = (isGlobal && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
+      const origin = isGlobal && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
+      const upstreamUrl = `${realmBase}/chat/completions`
+
+      // Global 域需要 system message
+      if (isGlobal) {
+        // global 兜底 system 注入（对齐 workbuddy2api ensureConsoleSystem：**首条**非 system 才注入）
+        ensureGlobalFallbackSystem(upstreamBody)
+      }
+
+      const headers = buildOauthHeaders(cfg, tokenState.access_token, {
+        origin,
+        apiType: provider.apiType,
+        cookies: tokenState.cookies,
+      })
+      // WorkBuddy 协议头（此前 Responses 路径完全缺失，导致风控头/UA/Accept-Language 全无）
+      if (isWorkbuddyProvider(provider)) {
+        injectWorkbuddyChatHeaders(headers, tokenState.access_token, isGlobal ? 'global' : 'cn', { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token }, cfg, { chatPath: true, chatMeta: wbChatMeta })
+      }
+
+      let response = await fetchUpstream(c.env, upstreamUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(upstreamBody),
+      }, originalStream === true)
+
+      // 401/403 时刷新重试
+      if ((response.status === 401 || response.status === 403) && tokenState.refresh_token) {
+        const refreshed = await refreshOauthToken(c.env, providerId, cfg)
+        if (refreshed) {
+          const freshState = await readOauthToken(c.env, providerId)
+          if (freshState?.access_token) {
+            const retryHeaders = buildOauthHeaders(cfg, freshState.access_token, {
+              origin,
+              apiType: provider.apiType,
+              cookies: freshState.cookies,
+            })
+            if (isWorkbuddyProvider(provider)) {
+              injectWorkbuddyChatHeaders(retryHeaders, freshState.access_token, isGlobal ? 'global' : 'cn', { uid: freshState.uid, enterprise_id: freshState.enterprise_id, domain: freshState.domain, device_token: freshState.device_token }, cfg, { chatPath: true, chatMeta: wbChatMeta })
+            }
+            response = await fetchUpstream(c.env, upstreamUrl, {
+              method: 'POST',
+              headers: retryHeaders,
+              body: JSON.stringify(upstreamBody),
+            }, originalStream === true)
+          }
+        }
+      }
+
+      if (!response.ok) {
+        const errText = await response.text()
+        try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → ${response.status} ${upstreamUrl}`, JSON.stringify({ error: errText, body: summarizeRequestBody(upstreamBody), url: upstreamUrl }).substring(0, 4000))) } catch {}
+        return c.json({
+          error: { message: `Upstream error: ${sanitizeUpstreamError(errText)}`, type: 'upstream_error' },
+        }, response.status as Parameters<typeof c.json>[1])
+      }
+
+      try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[responses] ${model} → 200 ${upstreamUrl}`, `stream=${originalStream}`)) } catch {}
+
+      // 流式
+      if (originalStream && response.body) {
+        const acc = {
+          responseId: '',
+          model: '',
+          itemId: null as string | null,
+          textContent: '',
+          toolCalls: new Map<number, { id: string; name: string; args: string }>(),
+          inputTokens: 0,
+          outputTokens: 0,
+          hasStarted: false,
+          completed: false,
+        }
+
+        const readable = new ReadableStream({
+          async start(controller) {
+            const decoder = new TextDecoderStream()
+            const textReader = response.body!.pipeThrough(decoder).getReader()
+            let lineBuffer = ''
+
+            try {
+              while (true) {
+                const { done, value } = await textReader.read()
+                if (done) break
+                const combined = lineBuffer + value
+                const lines = combined.split('\n')
+                lineBuffer = lines.pop() || ''
+
+                for (const line of lines) {
+                  const trimmed = line.trim()
+                  if (!trimmed.startsWith('data:')) continue
+                  const data = trimmed.slice(5).trim()
+                  if (!data || data === '[DONE]') continue
+
+                  try {
+                    const chunk = JSON.parse(data)
+                    cleanChunkDelta(chunk)
+                    const responsesSSE = openAIChunkToResponsesSSE(chunk, acc)
+                    if (responsesSSE) {
+                      controller.enqueue(new TextEncoder().encode(responsesSSE))
+                    }
+                  } catch { /* skip */ }
+                }
+              }
+            } catch { /* stream error */ }
+            // 确保发送 response.completed
+            if (!acc.completed) {
+              try {
+                controller.enqueue(new TextEncoder().encode(
+                  buildResponsesFallbackCompleted(acc)
+                ))
+              } catch { /* enqueue failed */ }
+            }
+            // G5: 流式结束后保存多轮历史
+            try {
+              if (g5Base && g5Save) g5Save(acc.responseId || `resp_${Date.now()}`, [...g5Base, buildG5AssistantMessage(acc.textContent, acc.toolCalls)])
+            } catch { /* 保存失败不影响响应 */ }
+            controller.close()
+          },
+        })
+
+        return new Response(readable, {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-store',
+            'X-Accel-Buffering': 'no',
+          },
+        })
+      }
+
+      // 非流式：聚合 OpenAI SSE → chat.completion → Responses
+      const allChunks: any[] = []
+      const decoder3 = new TextDecoderStream()
+      const textReader3 = response.body!.pipeThrough(decoder3).getReader()
+      let lineBuffer3 = ''
+
+      try {
+        while (true) {
+          const { done, value } = await textReader3.read()
+          if (done) break
+          const combined = lineBuffer3 + value
+          const lines = combined.split('\n')
+          lineBuffer3 = lines.pop() || ''
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed.startsWith('data:')) continue
+            const data = trimmed.slice(5).trim()
+            if (!data || data === '[DONE]') continue
+            try {
+              const chunk = JSON.parse(data)
+              cleanChunkDelta(chunk)
+              allChunks.push(chunk)
+            } catch { /* skip */ }
+          }
+        }
+      } catch { /* stream error */ }
+
+      // 聚合为 OpenAI chat.completion 再转为 Responses
+      const openaiResp = aggregateOpenAIToResponses(allChunks)
+      // G5: 保存本轮历史
+      try {
+        if (g5Base && g5Save) g5Save(String(openaiResp['id'] ?? ''), [...g5Base, responsesOutputToAssistantMessage(openaiResp['output'] as Array<Record<string, unknown>> | undefined)])
+      } catch { /* 保存失败不影响响应 */ }
+      return c.json(openaiResp)
+    }
+
+    // Anthropic 原生上游（provider.apiType === 'anthropic'，如 api.anthropic.com）：
+    // 请求体/认证头/路径都转成 Anthropic 原生格式，响应再转回 OpenAI Responses 格式
+    if (provider.apiType === 'anthropic') {
+      return await proxyAnthropicNativeUpstream(c, provider, providerId, modelId, openaiBody, originalStream, 'responses', g5Base, g5Save)
+    }
+
+    // 非 OAuth 提供商：用 apiKey 标准转发，始终发 OpenAI 格式到上游
+    const enabledKeys = provider.apiKeys.filter(k => k.enabled)
+    if (enabledKeys.length === 0) {
+      return c.json({
+        error: { type: 'configuration_error', message: `Provider "${provider.name}" has no enabled API keys` },
+      }, 500)
+    }
+
+    const resolvedBase = resolveProviderBaseUrl(c.env, provider.baseUrl)
+    if (!resolvedBase) {
+      return c.json({
+        error: { type: 'configuration_error', message: `Provider "${provider.name}" baseUrl has {CF_ACCOUNT_ID} placeholder but CF_ACCOUNT_ID env is not set` },
+      }, 500)
+    }
+    const cleanBase = resolvedBase.replace(/\/$/, '')
+    const forwardUrl = `${cleanBase}/chat/completions`
+    const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
+    // 清理上游不支持的字段 + 被屏蔽的 Claude Code 模板短语
+    sanitizeUpstreamBody(upstreamBody)
+    sanitizeBlockedTemplates(upstreamBody)
+    // R3：多 Key 顺序 failover——单 key 故障（HTTP 非 2xx 或网络异常）自动切换
+    // 下一个启用的 key，全部失败才把最后一次错误返回给客户端。
+    let response: Response | undefined
+    let lastErrText = ''
+    let lastStatus = 502
+    for (const key of enabledKeys) {
+      try {
+        const r = await fetchUpstream(c.env, forwardUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${key.key}`,
+          },
+          body: JSON.stringify(upstreamBody),
+        }, true)
+        if (r.ok) {
+          response = r
+          break
+        }
+        lastStatus = r.status
+        lastErrText = await r.text()
+      } catch (err) {
+        lastStatus = 502
+        lastErrText = (err as Error).message || '网络错误'
+      }
+    }
+
+    if (!response) {
+      try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → failover 全部失败 ${forwardUrl}`, JSON.stringify({ error: lastErrText, body: summarizeRequestBody(upstreamBody), url: forwardUrl }).substring(0, 4000))) } catch {}
+      return c.json({
+        error: { message: `Upstream error: ${lastErrText}`, type: 'upstream_error' },
+      }, lastStatus as Parameters<typeof c.json>[1])
+    }
+
+    try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[responses] ${model} → 200 ${forwardUrl}`, `stream=${originalStream}`)) } catch {}
+
+    // 流式：OpenAI SSE → Responses SSE 实时转换
+    if (originalStream && response.body) {
+      const acc = {
+        responseId: '',
+        model: '',
+        itemId: null as string | null,
+        textContent: '',
+        toolCalls: new Map<number, { id: string; name: string; args: string }>(),
+        inputTokens: 0,
+        outputTokens: 0,
+        hasStarted: false,
+        completed: false,
+      }
+
+      const readable = new ReadableStream({
+        async start(controller) {
+          const decoder = new TextDecoderStream()
+          const textReader = response.body!.pipeThrough(decoder).getReader()
+          let lineBuffer = ''
+
+          try {
+            while (true) {
+              const { done, value } = await textReader.read()
+              if (done) break
+              const combined = lineBuffer + value
+              const lines = combined.split('\n')
+              lineBuffer = lines.pop() || ''
+
+              for (const line of lines) {
+                const trimmed = line.trim()
+                if (!trimmed.startsWith('data:')) continue
+                const data = trimmed.slice(5).trim()
+                if (!data || data === '[DONE]') continue
+
+                try {
+                  const chunk = JSON.parse(data)
+                  cleanChunkDelta(chunk)
+                  const responsesSSE = openAIChunkToResponsesSSE(chunk, acc)
+                  if (responsesSSE) {
+                    controller.enqueue(new TextEncoder().encode(responsesSSE))
+                  }
+                } catch { /* skip */ }
+              }
+            }
+          } catch { /* stream error */ }
+          // G5: 本次流式结束后，保存「已解析历史 + 本次输入 + assistant 输出」供下一轮 previous_response_id
+          try {
+            const toolCalls: Array<Record<string, unknown>> = []
+            for (const [, t] of acc.toolCalls) toolCalls.push({ id: t.id, type: 'function', function: { name: t.name, arguments: t.args } })
+            const am = { role: 'assistant', content: acc.textContent || null } as Record<string, unknown>
+            if (toolCalls.length > 0) am['tool_calls'] = toolCalls
+            g5Save(acc.responseId || `resp_${Date.now()}`, [...g5Base, am])
+          } catch { /* 保存失败不影响响应 */ }
+          // 确保发送 response.completed
+          if (!acc.completed) {
+            try {
+              controller.enqueue(new TextEncoder().encode(
+                buildResponsesFallbackCompleted(acc)
+              ))
+            } catch { /* enqueue failed */ }
+          }
+          controller.close()
+        },
+      })
+
+      return new Response(readable, {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-store',
+          'X-Accel-Buffering': 'no',
+        },
+      })
+    }
+
+    // 非流式：聚合 OpenAI SSE → Responses
+    const allChunks: any[] = []
+    const decoder = new TextDecoderStream()
+    const textReader = response.body!.pipeThrough(decoder).getReader()
+    let lineBuffer3 = ''
+
+    try {
+      while (true) {
+        const { done, value } = await textReader.read()
+        if (done) break
+        const combined = lineBuffer3 + value
+        const lines = combined.split('\n')
+        lineBuffer3 = lines.pop() || ''
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed.startsWith('data:')) continue
+          const data = trimmed.slice(5).trim()
+          if (!data || data === '[DONE]') continue
+          try {
+            const chunk = JSON.parse(data)
+            cleanChunkDelta(chunk)
+            allChunks.push(chunk)
+          } catch { /* skip */ }
+        }
+      }
+    } catch { /* stream error */ }
+
+    const openaiResp = aggregateOpenAIToResponses(allChunks)
+    // G5: 保存本轮历史（已解析历史 + 本次输入 + assistant 输出）
+    try {
+      const am = responsesOutputToAssistantMessage(openaiResp['output'] as Array<Record<string, unknown>> | undefined)
+      g5Save(String(openaiResp['id'] ?? ''), [...g5Base, am])
+    } catch { /* 保存失败不影响响应 */ }
+    return c.json(openaiResp)
+  } catch (err) {
+    console.error('[responses] error:', err)
+    return c.json({ error: { message: 'Internal server error', type: 'server_error' } }, 500)
+  }
+}
+
+/**
+ * G5 辅助：把流式 acc 累积的文本与工具调用，整理成一条 OpenAI Chat 格式的 assistant 消息。
+ */
+function buildG5AssistantMessage(textContent: string, toolCalls: Map<number, { id: string; name: string; args: string }> | Array<{ id: string; name: string; args: string }>): Record<string, unknown> {
+  const calls: Array<Record<string, unknown>> = []
+  const list = toolCalls instanceof Map ? Array.from(toolCalls.values()) : toolCalls
+  for (const t of list) calls.push({ id: t.id, type: 'function', function: { name: t.name, arguments: t.args } })
+  const msg: Record<string, unknown> = { role: 'assistant', content: textContent || null }
+  if (calls.length > 0) msg['tool_calls'] = calls
+  return msg
+}
+
+/**
+ * 对单个 chunk 的 delta 做轻量清洗（去掉空 function_call 等噪音），
+ * 不修改原始 JSON 字符串，直接操作对象。
+ */
+function cleanChunkDelta(chunk: any): void {
+  const choices = chunk?.choices
+  if (!Array.isArray(choices)) return
+  for (const choice of choices) {
+    const delta = choice?.delta
+    if (!delta || typeof delta !== 'object') continue
+    // 去掉全空 function_call
+    if (delta.function_call !== undefined) {
+      if (delta.function_call === null) {
+        delete delta.function_call
+      } else if (typeof delta.function_call === 'object') {
+        const vals = Object.values(delta.function_call)
+        if (vals.length === 0 || vals.every((v: any) => v === null || v === '')) {
+          delete delta.function_call
+        }
+      }
+    }
+    // 去掉空 tool_calls 数组
+    if (Array.isArray(delta.tool_calls) && delta.tool_calls.length === 0) {
+      delete delta.tool_calls
+    }
+    // 去掉噪音字段
+    for (const noise of ['extra_fields', 'refusal', 'reasoning_content']) {
+      if (delta[noise] === null || delta[noise] === '' || delta[noise] === undefined) {
+        delete delta[noise]
+      }
+    }
+  }
+}
