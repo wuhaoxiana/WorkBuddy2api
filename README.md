@@ -81,7 +81,7 @@ src/
 
 ---
 
-## 快速开始
+## 一、快速开始
 
 ### 1. 本地开发
 
@@ -113,11 +113,11 @@ npx wrangler kv namespace create KV
 npx wrangler deploy
 ```
 
-或用 GitHub Actions（推荐，仓库已带 `.github/workflows/deploy.yml`）：
+**二、用 GitHub Actions自动部署（推荐，仓库已带 `.github/workflows/deploy.yml`）**
 
 | 类型 | 名称 | 说明 |
 | --- | --- | --- |
-| Secret | `CF_API_TOKEN` | Cloudflare API Token，权限 **Workers Scripts: Edit** |
+| Secret | `CF_API_TOKEN` | Cloudflare API Token，权限 **Workers Scripts: Edit + Workers KV Storage: Edit** |
 | Secret | `CF_ACCOUNT_ID` | Cloudflare Account ID |
 
 推送到 `main` 即自动执行「安装 → 类型检查 → 测试 → 部署」。
