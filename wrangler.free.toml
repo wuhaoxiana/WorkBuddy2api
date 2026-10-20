@@ -25,9 +25,10 @@ keep_vars = true
 [placement]
 mode = "smart"
 
-# KV namespace —— wrangler 按 name 自动解析
+# KV namespace —— wrangler 按 id 关联（title: workbuddy-2api_KV）
 [[kv_namespaces]]
 binding = "KV"
+id = "a80d341245a846aaa1e3739f0f428e25"
 
 [vars]
 # 保留该变量仅为兼容代码默认值；免费计划无 Analytics Engine 写入，

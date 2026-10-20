@@ -15,9 +15,10 @@ cpu_ms = 300_000
 [placement]
 mode = "smart"
 
-# KV namespace —— wrangler 按 name 自动解析
+# KV namespace —— wrangler 按 id 关联（title: workbuddy-2api_KV）
 [[kv_namespaces]]
 binding = "KV"
+id = "a80d341245a846aaa1e3739f0f428e25"
 
 # Analytics Engine 数据集 —— 记录代理请求用量（不绑定时统计看板自动降级为空数据）
 [[analytics_engine_datasets]]
