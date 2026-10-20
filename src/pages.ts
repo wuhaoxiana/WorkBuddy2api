@@ -148,6 +148,16 @@ textarea.input{min-height:92px;resize:vertical;line-height:1.6}
 .modal-b{padding:18px}
 .modal-f{padding:14px 18px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end}
 
+/* 一次性展示完整转发 Key：必须可选中、可整段复制，不能靠 toast 承载 */
+.notice{padding:10px 12px;border-radius:var(--r-sm);font-size:12.5px;line-height:1.65;margin-bottom:14px;border:1px solid}
+.notice.bad{background:#fff5f5;border-color:#f0c2c8;color:#b42333}
+.keybox{
+  display:block;background:var(--bg);border:1px solid var(--line-strong);border-radius:var(--r-sm);
+  padding:11px 12px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:13px;line-height:1.55;word-break:break-all;user-select:all;cursor:text;color:var(--text);
+}
+.hint-inline{color:var(--muted);font-size:12px;margin:8px 0 0}
+
 /* ===== 登录页 ===== */
 .login{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
 .login-card{width:100%;max-width:380px;background:var(--panel);border:1px solid var(--line);border-radius:16px;box-shadow:0 20px 60px rgba(20,24,33,.10);padding:28px}
@@ -488,6 +498,25 @@ export async function renderAdminPage(c: Context<AppEnv>) {
   </div>
 </div>
 
+<!-- Key 创建结果：完整 Key 只在此处展示这一次 -->
+<div class="mask" id="m-key-done">
+  <div class="modal">
+    <div class="modal-h"><h3>Key 已创建</h3><button class="btn btn-sm btn-ghost" data-close>关闭</button></div>
+    <div class="modal-b">
+      <div class="notice bad"><b>这段 Key 只显示这一次。</b>关闭后服务端只保留哈希，无法再查出完整值，请立即复制保存。</div>
+      <div class="field">
+        <label>完整 Key</label>
+        <code class="keybox" id="key-new-val"></code>
+        <p class="hint-inline">点击 Key 可整段选中；也可点右下角「复制 Key」。</p>
+      </div>
+    </div>
+    <div class="modal-f">
+      <button class="btn" data-close>我已保存，关闭</button>
+      <button class="btn btn-primary" id="btn-copy-new-key">复制 Key</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 <script>
 /* ================= 基础工具 ================= */
@@ -754,8 +783,7 @@ async function loadKeys() {
       const badge = !k.enabled ? '<span class="badge b-mute">已停用</span>' : expired ? '<span class="badge b-bad">已过期</span>' : '<span class="badge b-ok">有效</span>';
       return \`<tr>
         <td style="font-weight:600">\${esc(k.name || '(未命名)')}</td>
-        <td class="mono" style="font-size:12px">\${esc(k.key.slice(0, 10))}…\${esc(k.key.slice(-4))}
-          <button class="btn btn-sm" data-copy-text="\${esc(k.key)}">复制</button></td>
+        <td class="mono" style="font-size:12px">\${esc(k.key)}</td>
         <td>\${badge}</td>
         <td class="faint">\${esc(k.expiresAt ? fmtTime(new Date(k.expiresAt).getTime()) : '永久')}</td>
         <td class="tr nowrap">
@@ -764,7 +792,8 @@ async function loadKeys() {
         </td>
       </tr>\`;
     }).join('');
-    $('keys').innerHTML = \`<table><thead><tr><th>名称</th><th>Key</th><th>状态</th><th>到期</th><th class="tr">操作</th></tr></thead><tbody>\${rows}</tbody></table>\`;
+    $('keys').innerHTML = \`<table><thead><tr><th>名称</th><th>Key（脱敏）</th><th>状态</th><th>到期</th><th class="tr">操作</th></tr></thead><tbody>\${rows}</tbody></table>
+      <p class="hint-inline">完整 Key 只在创建时展示一次，服务端仅保存哈希，此处无法再查看或复制。若已丢失，请删除该条后重新创建。</p>\`;
     $('keys').querySelectorAll('[data-ktoggle]').forEach((b) => b.addEventListener('click', async () => {
       try {
         await api('/admin/api/proxy-keys/' + encodeURIComponent(b.dataset.ktoggle), {
@@ -981,7 +1010,11 @@ async function pollLogin(pid, quiet) {
 }
 
 // 新建 Key
-$('btn-new-key').addEventListener('click', () => $('m-key').classList.add('on'));
+$('btn-new-key').addEventListener('click', () => {
+  $('key-new-val').textContent = '';
+  $('k-name').value = '';
+  $('m-key').classList.add('on');
+});
 $('btn-create-key').addEventListener('click', async (e) => {
   const btn = e.currentTarget;
   try {
@@ -993,10 +1026,40 @@ $('btn-create-key').addEventListener('click', async (e) => {
     const k = (j.data || {}).key || '';
     $('m-key').classList.remove('on');
     await loadKeys();
-    if (k) { try { await navigator.clipboard.writeText(k); toast('已创建并复制到剪贴板', 'ok'); } catch (err) { toast('已创建：' + k, 'ok'); } }
-    else toast('已创建', 'ok');
+    // 完整 Key 只在创建响应里出现这一次：用弹窗常驻展示并允许手动选中。
+    // 不能再用 toast 承载——toast 2.8 秒自动消失，且窄气泡会把长 Key 省略号截断，
+    // 这正是「创建后看不到完整 Key」的根因。
+    if (!k) { toast('已创建，但响应未返回完整 Key，请删除后重建', 'bad'); return; }
+    $('key-new-val').textContent = k;
+    $('m-key-done').classList.add('on');
   } catch (err) { toast(err.message, 'bad'); }
   finally { busy(btn, false); }
+});
+
+/** 选中元素全部文本（剪贴板不可用时的兜底） */
+function selectElementText(el) {
+  try {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  } catch { /* 选择失败时至少文本可见 */ }
+}
+
+// 复制完整 Key：在点击事件内直接调用，保住用户手势上下文。
+// 若先 await 再调 clipboard，Chrome 会因手势过期抛 NotAllowedError 导致复制失败。
+$('btn-copy-new-key').addEventListener('click', async () => {
+  const el = $('key-new-val');
+  const k = (el.textContent || '').trim();
+  if (!k) return;
+  try {
+    await navigator.clipboard.writeText(k);
+    toast('已复制完整 Key', 'ok');
+  } catch (err) {
+    selectElementText(el);
+    toast('浏览器拒绝自动复制，已选中文本，请按 Ctrl+C', 'bad');
+  }
 });
 
 // 快捷操作
