@@ -2372,7 +2372,24 @@ async function proxyOAuthRequestPooledCore(
     }
   }
 
-  throw new Error('no healthy account (cooling/disabled)' + (lastErr ? ': ' + lastErr.message : ''))
+  // 无可用账号时把池内禁用原因一并带出。否则当所有账号都被硬禁用时（lastErr 为空），
+  // 客户端只看到「cooling/disabled」，无法区分两类完全不同的处置：
+  //   - 冷却（cooling）：等几分钟自动恢复，无需人工介入
+  //   - 禁用（disabled）：账号被上游封禁（如 11140 request illegal）或会话吊销，必须重新 OAuth 登录
+  let disabledHint = ''
+  try {
+    const pool = await readOauthPool(c.env, provider.id)
+    const disabled = pool.filter((a) => a.state?.disabled === true)
+    if (disabled.length > 0) {
+      const reasons = Array.from(new Set(
+        disabled.map((a) => String(a.state?.reason || '')).filter((r) => r.length > 0),
+      ))
+      disabledHint = `；${disabled.length} 个账号已被禁用${reasons.length > 0 ? `（${reasons.join(' / ')}）` : ''}`
+    }
+  } catch {
+    // 诊断信息读取失败不影响主错误抛出
+  }
+  throw new Error('no healthy account (cooling/disabled)' + disabledHint + (lastErr ? ': ' + lastErr.message : ''))
 }
 
 /** WorkBuddy 多账号池 OpenAI 转发入口（透传/聚合 + 错误 JSON）。 */
